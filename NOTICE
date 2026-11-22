@@ -1,0 +1,18 @@
+whyred-metal
+
+This repository is a rewrite for the Redmi Note 5 (whyred, SDM636, Adreno 509) of the Adreno 5xx
+bring-up ladder first assembled in lavender-metal:
+  https://github.com/pcorezzola/lavender-metal
+
+That work in turn adapts hakios-xnu-kernel:
+  https://github.com/oosexgang/hakios-xnu-kernel
+
+Licenses of the upstream material:
+  kernel/   APSL 2.0, derivative of XNU and the hakios drivers/gpu code
+  userland/ MIT, including Mesa's a5xx.xml and adreno_pm4.xml (MIT) and hakios-metal (MIT)
+  docs/     MIT, except where a document names another license
+  tools/    MIT
+
+No Apple binaries, firmware images or Qualcomm blobs are distributed here. Firmware is read from the
+user's own stock ROM. The lavender-metal repository is a behavioural reference; no commit from it is
+carried into this repository's history.
