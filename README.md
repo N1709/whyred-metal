@@ -2,11 +2,10 @@
 
 GPU bring-up for the **Redmi Note 5 (whyred, Snapdragon 636, Adreno 509)** running iOS 16 through the
 [ios-whyred](https://github.com/N1709/ios-whyred) port: an Adreno 509 kernel driver for XNU and a
-Metal-compatible layer on top of it, so that iOS stops drawing everything on the CPU.
+Metal-compatible layer on top of it, so iOS stops drawing everything on the CPU.
 
-This repository is a **fresh rewrite for whyred**. The bring-up ladder was first assembled and proven on the
-Redmi Note 7 (lavender, Adreno 512); no commit from that repository is carried here. The code, names, hardware
-constants and documents below are being reworked for the Adreno 509. See `docs/REFERENCES.md` for provenance.
+This repository is the whyred implementation. The hardware constants, firmware names, register map and
+documents are for the Adreno 509 and SDM636 only. No code or history from another phone's GPU tree is carried.
 
 ## Why
 
@@ -33,24 +32,25 @@ whyred is still to be done.
 The status of the **port** (display, touch, USB, audio, WLAN, modem, power) lives in
 [ios-whyred](https://github.com/N1709/ios-whyred), not here. This repository is only the GPU.
 
-## What is different from lavender
+## Hardware
 
-| | lavender (A512) | whyred (A509) |
-| --- | --- | --- |
-| SoC | SDM660 | SDM636 |
-| GPU | Adreno 512, chip id `0x05010200` | Adreno 509, chip id `0x05000900` |
-| GPU block | `0x05000000`, 256 KiB | `0x05000000`, 256 KiB |
-| GPUCC | `0x05065000` | `0x05065000` |
-| Zap | `a512_zap.mdt` | `a512_zap.mdt` (Linux: "Adreno 509 uses the same ZAP as 512") |
-| PM4/PFP | `a530_pm4.fw`, `a530_pfp.fw` | same |
-| GPMU | none | none |
-| Panel | 1080x2340, stride 4320 | 1080x2160, stride 4320 |
-| Board define | `ARM64_BOARD_CONFIG_LAVENDER` | `ARM64_BOARD_CONFIG_WHYRED` |
-| Boot arg | `lavgpu=N` | `whyredgpu=N` |
-| Firmware path | `/usr/share/firmware/lavender/gpu/` | `/usr/share/firmware/whyred/gpu/` |
+| | whyred |
+| --- | --- |
+| SoC | SDM636 / Snapdragon 636 |
+| GPU | Adreno 509, chip id `0x05000900` |
+| GPU block | `0x05000000`, 256 KiB |
+| GPUCC | `0x05065000` |
+| Zap | `a512_zap.mdt` (Linux `a5xx_catalog.c`: the 509 uses the same ZAP as the 512) |
+| PM4/PFP | `a530_pm4.fw`, `a530_pfp.fw` |
+| GPMU | none |
+| GMEM | 256 KiB + 16 KiB |
+| Panel | 1080x2160, stride 4320 |
+| Board define | `ARM64_BOARD_CONFIG_WHYRED` |
+| Boot arg | `whyredgpu=N` |
+| Firmware path | `/usr/share/firmware/whyred/gpu/` |
 
-The GPU frequency ladder is **not** copied from lavender. Read `qcom,gpu-pwrlevels-*` from the whyred DTS and
-record it in `docs/HARDWARE-A509.md` before the first power-up run.
+The GPU frequency ladder is **not** assumed. Read `qcom,gpu-pwrlevels-*` from the whyred DTS and record it in
+`docs/HARDWARE-A509.md` before the first power-up run.
 
 ## Starting point
 
@@ -71,7 +71,7 @@ The reference tree is kept (sparse, not committed) under `refs/hakios` at the co
 
 ## Roadmap
 
-Details and "done when" criteria per milestone are in [`docs/PLAN.md`](docs/PLAN.md).
+Details and "done when" criteria per stage are in [`docs/PLAN.md`](docs/PLAN.md).
 
 - **Hardware map:** register map done; whyred firmware extraction and pwrlevel table pending.
 - **Power and identify:** power the GDSCs/clocks, read the chip id, confirm PAS 13. Not run on whyred.
@@ -87,8 +87,6 @@ Details and "done when" criteria per milestone are in [`docs/PLAN.md`](docs/PLAN
 - [N1709/ios-whyred](https://github.com/N1709/ios-whyred): the iOS 16 port for the Redmi Note 5 that this GPU
   work serves. The kernel ladder is built into the port as `drivers/gpu/whyred_gpu.c` (patch `0211`); the IOKit
   service in this repository is not merged there yet.
-- [pcorezzola/lavender-metal](https://github.com/pcorezzola/lavender-metal): the Adreno 512 bring-up that proved
-  the ladder on lavender. It is a reference for the sequence, not a source of commits for this repository.
 - This repository: research, host-side tests and the plan; no firmware or Qualcomm blobs are committed.
 
 ## Layout
@@ -100,7 +98,7 @@ firmware/   GPU firmware taken from the phone's own ROM (not committed)
 tools/      scripts (firmware extraction, DTB reading, table generation)
 kernel/     XNU chip driver (whyred_gpu.c) and IOKit service (WhyredGPU.cpp)
 userland/   A5xx register/packet layer, fake CP, host tests
-notes/      working notes per milestone
+notes/      working notes
 ```
 
 ## Legal

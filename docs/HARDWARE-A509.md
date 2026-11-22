@@ -6,7 +6,7 @@ Sources: the whyred Android device tree (the register map transcribed in
 `ios-whyred/resources/whyred_dtb.bin` has no GPU node; use the full Android DTS for the pwrlevel table.
 
 **Nothing here is measured on the running whyred iOS port yet.** It is the map the first ladder run must
-confirm. Values that are shared with the A512 are marked as such; do not copy the lavender frequency table.
+confirm. Values shared with other A5xx parts are marked as such; the frequency table is whyred's own.
 
 ## The GPU node (`/soc/qcom,kgsl-3d0@5000000`)
 
@@ -51,7 +51,7 @@ The driver talks to these blocks through raw MMIO, not a clock framework:
 
 ## Frequencies
 
-**Do not reuse the lavender A512 table.** The whyred DTS carries its own `qcom,gpu-pwrlevels-*`; read it
+**Do not assume another A5xx frequency table.** The whyred DTS carries its own `qcom,gpu-pwrlevels-*`; read it
 with `tools/dtb_dump.py` and record the exact frequencies, corners and initial level here before the
 first power-up run.
 

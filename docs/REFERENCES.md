@@ -8,7 +8,6 @@
 | whyred hardware map | `ios-whyred/drivers/gpu/hw.md`, `ios-whyred/drivers/gpu/adreno/native/GpuRegs.h` | n/a (project data) | GPU node, GPUCC, GDSCs, SMMU, IRQ, zap pas-id |
 | whyred Android DTS | vendor kernel `arch/arm64/boot/dts/qcom/` (not committed) | n/a (device data) | pwrlevels, clocks, regulators |
 | ios-whyred | https://github.com/N1709/ios-whyred | see repo | The port this driver plugs into |
-| lavender-metal | https://github.com/pcorezzola/lavender-metal | see repo | Behavioural reference for the A512 ladder; no commit or file history is carried |
 
 ## hakios reference tree
 

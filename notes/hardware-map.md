@@ -1,8 +1,8 @@
 # Hardware map log
 
 2026-11-22
-- whyred-metal created as a fresh rewrite for the Redmi Note 5 (whyred, SDM636, Adreno 509). No commit
-  from lavender-metal is carried; the lavender ladder is a behavioural reference only.
+- whyred-metal created for the Redmi Note 5 (whyred, SDM636, Adreno 509). This log records the hardware
+  map and the first power-up plan; no device run yet.
 - Register map from `ios-whyred/drivers/gpu/hw.md` and
   `ios-whyred/drivers/gpu/adreno/native/GpuRegs.h`: kgsl-3d0 at `0x05000000` (size `0x40000`), chip id
   `0x05000900`, IRQ SPI 300, GPUCC at `0x05065000` (size `0x10000`), GDSC CX at `+0x1004` (hw status

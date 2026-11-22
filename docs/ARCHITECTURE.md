@@ -74,6 +74,6 @@ the A5xx work is validated on the host. The ir3 compiler path needs no chip port
 | Userland Metal layer, a5xx tables | MIT | adapted from `hakios-metal/`, Mesa (MIT) |
 | Firmware | not distributed | read from the user's own stock ROM |
 
-GPL code (Linux msm, metal2vulkan) is used only as reading material, never copied. The lavender-metal
-ladder is a behavioural reference for the bring-up order; this repository's files are rewritten for
-whyred and carry no lavender commit.
+GPL code (Linux msm, metal2vulkan) is used only as reading material, never copied. The bring-up order is
+derived from the Linux msm `a5xx` driver and Mesa freedreno for this device; every whyred register value
+comes from the whyred DTS or the Adreno 509 entry in Linux `a5xx_catalog.c`.
