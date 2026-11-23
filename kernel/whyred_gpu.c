@@ -302,7 +302,7 @@ step4_gx(void)
 	uint32_t v, ldo_ctl_saved;
 
 	/*
-	 * Run 3 (0236): the GX GDSC left the off state (GDSCR 08222000) but never
+	 * Run 3: the GX GDSC left the off state (GDSCR 08222000) but never
 	 * reported PWR_ON. The DT marks it qcom,force-enable-root-clk with
 	 * core_root_clk = the GFX3D RCG, which was still ROOT_OFF. Turn the root on
 	 * first; its source is XO (cfg 0, 19.2 MHz), no PLL and no rail involved.
@@ -321,7 +321,7 @@ step4_gx(void)
 	ldo_bhs_mode();
 	dump_ldo("after bhs");
 	/*
-	 * Run 5 (0238): the LDO bits were already in BHS state and the GX GDSC
+	 * Run 5: the LDO bits were already in BHS state and the GX GDSC
 	 * still stayed at 08222000. The vendor GDSC driver does three more things
 	 * BEFORE it clears SW_COLLAPSE (gdsc-regulator.c, behaviour reference):
 	 * pulse the GX block reset (sw-reset = GPUCC+0x1090 bit 0), pulse the
