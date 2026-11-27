@@ -26,8 +26,8 @@ whyred is still to be done.
 | Ring, microcode, fence | Code ready, not run | Zap through SCM PAS 13, kgsl SMMU identity table, PM4/PFP, ring, `ME_INIT`, fence. |
 | A5xx compute | Host tests pass, device pending | `userland/tests/cp_test.cpp` passes; no dispatch on whyred yet. |
 | Render and panel | Code ready, device pending | 2D blit, textured 3D draw, blending, panel copy. |
-| IOKit service | Code ready, device pending | `WhyredGPU` / `WhyredGPUUserClient`, four selectors, synchronous submit. |
-| Metal plug-in | Not started | `MTLDevice` plug-in and CoreAnimation acceptance. |
+| IOKit service | Merged in ios-whyred, device pending | `WhyredGPU` / `WhyredGPUUserClient` as patches `0217`/`0240`: six selectors, contiguous pool, submit-by-buffer, Metal plug-in properties. Host-checked; no device registration yet. |
+| Metal plug-in | Not started | `MTLDevice` plug-in and CoreAnimation acceptance. The kernel properties (`whyredmetal=1`) exist; the bundle still has to be written and built on macOS. |
 
 The status of the **port** (display, touch, USB, audio, WLAN, modem, power) lives in
 [ios-whyred](https://github.com/N1709/ios-whyred), not here. This repository is only the GPU.
@@ -79,15 +79,17 @@ Details and "done when" criteria per stage are in [`docs/PLAN.md`](docs/PLAN.md)
   read a fence. Not run on whyred.
 - **A5xx compute:** generated tables and fake CP pass on the host; one real dispatch pending.
 - **Render and panel:** blit/draw/blend paths are written; panel output pending.
-- **IOKit service:** service and user client are written; device registration pending.
+- **IOKit service:** merged into ios-whyred as `0217`, extended by `0240`
+  (pool, submit-by-buffer, Metal properties); device registration pending.
 - **Metal plug-in:** not started.
 
 ## Related repositories
 
 - [N1709/ios-whyred](https://github.com/N1709/ios-whyred): the iOS 16 port for the Redmi Note 5 that this GPU
-  work serves. The kernel ladder is built into the port as `drivers/gpu/whyred_gpu.c` (patch `0211`); the IOKit
-  service in this repository is not merged there yet.
-- This repository: research, host-side tests and the plan; no firmware or Qualcomm blobs are committed.
+  work serves. The kernel ladder is `drivers/gpu/whyred_gpu.c` (patch `0211`), the IOKit service is
+  `WhyredGPU.cpp` (patches `0217`/`0240`), and `kernel/` here is a snapshot of those files.
+- This repository: research, the A5xx userland layer, host-side tests and the plan; no firmware or Qualcomm
+  blobs are committed.
 
 ## Layout
 
@@ -96,7 +98,7 @@ docs/       plan, hardware notes, references
 refs/       reference trees (not committed; see docs/REFERENCES.md)
 firmware/   GPU firmware taken from the phone's own ROM (not committed)
 tools/      scripts (firmware extraction, DTB reading, table generation)
-kernel/     XNU chip driver (whyred_gpu.c) and IOKit service (WhyredGPU.cpp)
+kernel/     snapshots of the XNU chip driver (whyred_gpu.c) and IOKit service (WhyredGPU.cpp)
 userland/   A5xx register/packet layer, fake CP, host tests
 notes/      working notes
 ```

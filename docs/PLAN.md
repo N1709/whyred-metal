@@ -53,14 +53,19 @@ Result: every resource and where it comes from is listed before the first regist
 
 ## IOKit service
 
-- `WhyredGPU` service and `WhyredGPUUserClient`: info / buffer new / buffer free / submit.
+- [x] `WhyredGPU` service and `WhyredGPUUserClient`: info / buffer new / buffer free / submit, merged
+      into ios-whyred as `0217`.
+- [x] `0240`: contiguous pool, submit-by-buffer, and the `MetalPluginName` / `MetalPluginClassName`
+      properties behind `whyredmetal=1`.
 - Submit is synchronous: PM4 stream, cache flush, fence; the call returns when the GPU reaches the fence.
 - Done when: a userland client opens the service, allocates a buffer, submits a stream and reads the
-  fence on whyred.
+  fence on whyred. Host-checked only; the GPU ladder has never run on the phone.
 
 ## Plug-in Metal
 
 - `MTLDevice` plug-in over the IOKit service; CoreAnimation over Metal.
+- Source to adapt: lavender-metal's `LavenderMetal.m`; the shader compiler comes from hakios's Mesa
+  patches (`AIR -> NIR -> ir3`). It must be built on macOS with the iPhoneOS SDK.
 - Done when: `MTLCreateSystemDefaultDevice()` returns a device, the idle lock screen costs a fraction of
   today's CPU, and Astronomy renders.
 

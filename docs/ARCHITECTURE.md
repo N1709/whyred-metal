@@ -12,7 +12,7 @@
    |  IOKit user client calls (selector = DRM request number)
    v
  WhyredGPU service (WhyredGPU.cpp)                           kernel, APSL, adapted (chip independent)
-   |  four selectors: info / buffer new / buffer free / submit
+   |  six selectors: info / buffer new / buffer free / submit / submit-buffer / metal
    v
  chip driver (whyred_gpu.c for the Adreno 509)               kernel, REWRITE for A5xx
    |  clocks, GDSC, SMMU, ring, microcode, zap (SCM), CP start, submit, fence
@@ -23,7 +23,7 @@
 ## The seam
 
 `WhyredGPU.cpp` (the IOKit service and user client) never touches a register. It calls the chip driver
-through a small C interface (`whyred_gpu_service_ready`, `whyred_gpu_service_submit`) and exposes four
+through a small C interface (`whyred_gpu_service_ready`, `whyred_gpu_service_submit`) and exposes six
 selectors to userland:
 
 | Selector | Direction | Meaning |
@@ -32,9 +32,15 @@ selectors to userland:
 | 1 `kWhyredBufNew` | in/out | allocate a physically contiguous, zeroed, mappable buffer; return its GPU address |
 | 2 `kWhyredBufFree` | in | release a buffer handle |
 | 3 `kWhyredSubmit` | in/out | PM4 words, then a cache flush and a fence; returns when the GPU reaches the fence |
+| 4 `kWhyredSubmitBuf` | in/out | a PM4 stream already in a client buffer; same fence |
+| 5 `kWhyredMetal` | in | set or remove `MetalPluginName` / `MetalPluginClassName` on `IOAcceleratorES` |
 
-The long-term Metal path replaces these four selectors with the msm DRM request numbers used by
-`hakios.gpu.cpp` (`DRM_MSM_GET_PARAM`, `GEM_NEW`, `GEM_SUBMIT`, `WAIT_FENCE`, ...). The four-selector
+A buffer is a page slice of one contiguous pool (128 MB down to 4 MB, taken when `whyredgpu=30` starts
+the service) or its own allocation when the pool is gone. The pool exists because the low 4 GB is
+fragmented by the time the ring is up, and the Metal plug-in allocates many small buffers.
+
+The long-term Metal path replaces these six selectors with the msm DRM request numbers used by
+`hakios.gpu.cpp` (`DRM_MSM_GET_PARAM`, `GEM_NEW`, `GEM_SUBMIT`, `WAIT_FENCE`, ...). The six-selector
 service is the bring-up interface: one trusted client, no security boundary.
 
 ## What changes for A5xx (the chip driver)
@@ -54,8 +60,9 @@ does not find what it expects. A wrong access on a Qualcomm SoC often ends the r
 ring must flush before each risky access.
 
 The ladder in this repository runs through the panel copy and the IOKit service. The ios-whyred port
-currently carries the power/ring/compute/render subset in `xnu/patches/0211-whyred-gpu-driver.patch`;
-the panel copy and the service are not merged there yet.
+carries the ladder and the service as `xnu/patches/0211-whyred-gpu-driver.patch` and
+`0217-whyred-gpu-service.patch`, extended by `0240-whyred-gpu-metal-service.patch`; the panel copy is
+not merged there yet. `kernel/` here is a snapshot of those two files.
 
 ## What changes for userland
 
