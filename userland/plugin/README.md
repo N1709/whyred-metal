@@ -62,7 +62,24 @@ bison; it installs what it can under `$B` (default `/tmp/mi`). The result is
 The `whymetal` workflow (`.github/workflows/whymetal.yml`) runs the same two
 steps on a macOS runner and uploads `WhyredMetal.bundle` and
 `whyredmetal_test` as artifacts, so the bundle can be built without a local
-Mac.
+Mac. The first green build is run `45943080501` (commit `eccb11d`): an 8 MB
+thin arm64 `WhyredMetal`, `NSPrincipalClass = WhyredMetalDevice`, ad-hoc
+signed.
+
+## Install into the iOS root
+
+```sh
+# root image mounted read-write at /mnt/iosroot
+sudo userland/plugin/install-whyredmetal.sh /mnt/iosroot
+```
+
+It checks the binary is arm64, copies the bundle to
+`/System/Library/Extensions/WhyredMetal.bundle`, and sets root:wheel and the
+usual modes. It does not touch a partition; install the root image the way
+the port installs any root, with the user's permission.
+
+Then boot with `whyredgpu=30 whyredmetal=1`. `whyredmetal=1` only publishes
+the properties on `IOAcceleratorES`; the bundle has to be in the root first.
 
 ## Install and run
 
