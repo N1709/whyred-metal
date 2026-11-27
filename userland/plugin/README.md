@@ -59,6 +59,11 @@ bash build-whyredmetal.sh
 bison; it installs what it can under `$B` (default `/tmp/mi`). The result is
 `userland/plugin/out/WhyredMetal.bundle` and `out/whyredmetal_test`.
 
+The `whymetal` workflow (`.github/workflows/whymetal.yml`) runs the same two
+steps on a macOS runner and uploads `WhyredMetal.bundle` and
+`whyredmetal_test` as artifacts, so the bundle can be built without a local
+Mac.
+
 ## Install and run
 
 Copy the bundle into the iOS root at

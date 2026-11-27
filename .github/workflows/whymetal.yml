@@ -1,0 +1,43 @@
+name: whymetal
+
+# Build WhyredMetal.bundle on a macOS runner: Xcode + the iPhoneOS SDK + Mesa's
+# ir3 and hakios's AIR front end. The result is an artifact to copy into the iOS
+# root; nothing here touches a phone.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'userland/plugin/**'
+      - 'tools/mesa-ios/**'
+      - '.github/workflows/whymetal.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 360
+    env:
+      B: ${{ runner.temp }}/mi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: hakios Mesa patch tree
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/oosexgang/hakios-xnu-kernel.git hakios
+          git -C hakios sparse-checkout set --no-cone components/metal/plugin/tools/mesa
+
+      - name: Mesa 25.0.7 for arm64 iOS
+        run: tools/mesa-ios/build-mac.sh hakios/components/metal/plugin/tools/mesa
+
+      - name: WhyredMetal.bundle
+        run: bash userland/plugin/build-whyredmetal.sh
+
+      - name: upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: WhyredMetal.bundle
+          path: |
+            userland/plugin/out/WhyredMetal.bundle
+            userland/plugin/out/whyredmetal_test
+          if-no-files-found: error
