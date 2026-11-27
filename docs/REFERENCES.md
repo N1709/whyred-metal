@@ -3,6 +3,7 @@
 | What | Where | License | Used for |
 | --- | --- | --- | --- |
 | hakios-xnu-kernel | https://github.com/oosexgang/hakios-xnu-kernel (commit `63fc2b4`, 2026-11-06) | `hakios-metal/` MIT; `drivers/gpu/`, `xnu/files/` APSL 2.0 | Architecture: Metal driver on Adreno A6xx, IOKit GPU service, AIR -> NIR -> ir3 front end, fake GPU, probe |
+| lavender-metal | https://github.com/aLpHa-Git-69/lavender-metal (commit `cc5b8db`) | MIT (Copyright (c) 2025-2026 the HakiOS authors) | `userland/plugin/`: the Metal plug-in, A5xx PM4 builders, compiler wrapper and iOS Mesa build recipe, adapted and renamed for whyred |
 | Mesa freedreno | https://gitlab.freedesktop.org/mesa/mesa (`src/freedreno/`) | MIT | `a5xx.xml`, `adreno_pm4.xml`, ir3 compiler, Gallium `fd5` (A5xx sequences), `freedreno_devices.py` |
 | Linux msm DRM / a5xx | linux `drivers/gpu/drm/msm/adreno/a5xx_*.c` | GPL-2.0 | Behaviour reference only (bring-up order, firmware names); no code copied |
 | whyred hardware map | `ios-whyred/drivers/gpu/hw.md`, `ios-whyred/drivers/gpu/adreno/native/GpuRegs.h` | n/a (project data) | GPU node, GPUCC, GDSCs, SMMU, IRQ, zap pas-id |

@@ -1,0 +1,130 @@
+// Kernels the compute test uses. Build: userland/kernels/build.sh (on the Mac, Metal Toolchain installed).
+#include <metal_stdlib>
+using namespace metal;
+
+// out[i] = i * 0x9e3779b1 + seed
+kernel void fill_id(device uint *out [[buffer(0)]], constant uint &seed [[buffer(1)]], uint id [[thread_position_in_grid]])
+{
+	out[id] = id * 0x9e3779b1u + seed;
+}
+
+// y[i] = a * x[i] + y[i]
+kernel void saxpy(device const float *x [[buffer(0)]], device float *y [[buffer(1)]], constant float &a [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+	y[id] = a * x[id] + y[id];
+}
+
+// out[i] = in[i] squared, as integers
+kernel void square(device const uint *in [[buffer(0)]], device uint *out [[buffer(1)]], uint id [[thread_position_in_grid]])
+{
+	out[id] = in[id] * in[id];
+}
+
+// ---- render (M5.4) ----
+struct TriOut {
+	float4 pos [[position]];
+	float4 color;
+};
+
+// three vertices from the vertex id alone, no vertex buffer
+vertex TriOut tri_vs(uint vid [[vertex_id]])
+{
+	TriOut o;
+	float x = vid == 1 ? 0.8 : (vid == 2 ? 0.0 : -0.8);
+	float y = vid == 2 ? 0.8 : -0.8;
+	o.pos = float4(x, y, 0.0, 1.0);
+	o.color = float4(vid == 0 ? 1.0 : 0.0, vid == 1 ? 1.0 : 0.0, vid == 2 ? 1.0 : 0.0, 1.0);
+	return o;
+}
+
+struct AttrIn {
+	float2 pos [[attribute(0)]];
+	float4 color [[attribute(1)]];
+};
+
+// the same from a vertex buffer: float2 position, float4 colour
+vertex TriOut attr_vs(AttrIn in [[stage_in]])
+{
+	TriOut o;
+	o.pos = float4(in.pos, 0.0, 1.0);
+	o.color = in.color;
+	return o;
+}
+
+fragment float4 tri_fs(TriOut in [[stage_in]])
+{
+	return in.color;
+}
+
+// ---- sampling and blending (M5.6) ----
+struct TexOut {
+	float4 pos [[position]];
+	float2 uv;
+};
+
+// a quad of two triangles from the vertex id: 0.9 of the target, uv with the origin at the top left
+vertex TexOut quad_vs(uint vid [[vertex_id]])
+{
+	TexOut o;
+	float x = (vid == 1 || vid == 4 || vid == 5) ? 1.0 : -1.0;
+	float y = (vid == 2 || vid == 3 || vid == 5) ? 1.0 : -1.0;
+	o.pos = float4(x * 0.9, y * 0.9, 0.0, 1.0);
+	o.uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5);
+	return o;
+}
+
+fragment float4 tex_fs(TexOut in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]])
+{
+	return t.sample(s, in.uv);
+}
+
+fragment float4 half_fs(TexOut in [[stage_in]])
+{
+	return float4(1.0, 0.0, 0.0, 0.5);
+}
+
+// ---- device buffers in the vertex stage (M5.6) ----
+// positions in verts[0..2], colours in verts[3..5]: what CoreAnimation's path_* and fixed_vert_* functions do
+vertex TriOut ssbo_vs(uint vid [[vertex_id]], const device float4 * verts [[buffer(0)]])
+{
+	TriOut o;
+	o.pos = float4(verts[vid].xy, 0.0, 1.0);
+	o.color = verts[vid + 3];
+	return o;
+}
+
+// ---- multiple render targets (M5.6): what CoreAnimation's *_shading_frag and path_*_frag functions write ----
+struct MrtOut {
+	float4 c0 [[color(0)]];
+	float4 c1 [[color(1)]];
+	float4 c2 [[color(2)]];
+};
+
+fragment MrtOut mrt_fs(TexOut in [[stage_in]])
+{
+	MrtOut o;
+	o.c0 = float4(1.0, 0.0, 0.0, 1.0);
+	o.c1 = float4(0.0, 1.0, 0.0, 1.0);
+	o.c2 = float4(in.uv.x, in.uv.y, 1.0, 1.0);
+	return o;
+}
+
+// ---- point size (M5.6): CoreAnimation's fixed_vert_* functions write them ----
+struct PtOut {
+	float4 pos [[position]];
+	float size [[point_size]];
+};
+
+vertex PtOut point_vs(uint vid [[vertex_id]])
+{
+	PtOut o;
+	o.pos = float4(0.0, 0.0, 0.0, 1.0);
+	o.size = 8.0;
+	return o;
+}
+
+fragment float4 white_fs()
+{
+	return float4(1.0, 1.0, 1.0, 1.0);
+}

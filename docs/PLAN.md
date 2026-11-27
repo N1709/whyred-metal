@@ -63,9 +63,14 @@ Result: every resource and where it comes from is listed before the first regist
 
 ## Plug-in Metal
 
-- `MTLDevice` plug-in over the IOKit service; CoreAnimation over Metal.
-- Source to adapt: lavender-metal's `LavenderMetal.m`; the shader compiler comes from hakios's Mesa
-  patches (`AIR -> NIR -> ir3`). It must be built on macOS with the iPhoneOS SDK.
+- [x] Source: `userland/plugin/` holds `WhyredMetal.m`, the A5xx builders
+      (`why5.c`, `why5r.c`), the AIR -> NIR -> ir3 wrapper (`whycc.cpp`, `hk/`)
+      and the Mesa register headers. Adapted from lavender-metal and renamed
+      for `WhyredGPU`; the compiler targets GPU id 509.
+- [ ] Build `WhyredMetal.bundle` on macOS with the iOS Mesa archives
+      (`tools/mesa-ios/build-mac.sh`), install it in the iOS root.
+- [ ] Run `whyredmetal_test` with `whyredgpu=30 whyredmetal=1`; then
+      CoreAnimation over Metal.
 - Done when: `MTLCreateSystemDefaultDevice()` returns a device, the idle lock screen costs a fraction of
   today's CPU, and Astronomy renders.
 

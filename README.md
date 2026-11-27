@@ -5,7 +5,10 @@ GPU bring-up for the **Redmi Note 5 (whyred, Snapdragon 636, Adreno 509)** runni
 Metal-compatible layer on top of it, so iOS stops drawing everything on the CPU.
 
 This repository is the whyred implementation. The hardware constants, firmware names, register map and
-documents are for the Adreno 509 and SDM636 only. No code or history from another phone's GPU tree is carried.
+documents are for the Adreno 509 and SDM636 only. The Metal plug-in is adapted from
+[`lavender-metal`](https://github.com/aLpHa-Git-69/lavender-metal) and
+[`hakios-metal`](https://github.com/oosexgang/hakios-xnu-kernel) (MIT, attributed in
+`userland/plugin/README.md`); every chip-specific value is checked against the whyred A5xx tables.
 
 ## Why
 
@@ -27,7 +30,7 @@ whyred is still to be done.
 | A5xx compute | Host tests pass, device pending | `userland/tests/cp_test.cpp` passes; no dispatch on whyred yet. |
 | Render and panel | Code ready, device pending | 2D blit, textured 3D draw, blending, panel copy. |
 | IOKit service | Merged in ios-whyred, device pending | `WhyredGPU` / `WhyredGPUUserClient` as patches `0217`/`0240`: six selectors, contiguous pool, submit-by-buffer, Metal plug-in properties. Host-checked; no device registration yet. |
-| Metal plug-in | Not started | `MTLDevice` plug-in and CoreAnimation acceptance. The kernel properties (`whyredmetal=1`) exist; the bundle still has to be written and built on macOS. |
+| Metal plug-in | Source added, build pending | `userland/plugin/`: `MTLDevice`, buffers, queue, blit/compute encoders and the AIR -> ir3 compiler, adapted from lavender-metal and renamed for `WhyredGPU`. Built on macOS; not run on whyred. |
 
 The status of the **port** (display, touch, USB, audio, WLAN, modem, power) lives in
 [ios-whyred](https://github.com/N1709/ios-whyred), not here. This repository is only the GPU.
@@ -81,7 +84,8 @@ Details and "done when" criteria per stage are in [`docs/PLAN.md`](docs/PLAN.md)
 - **Render and panel:** blit/draw/blend paths are written; panel output pending.
 - **IOKit service:** merged into ios-whyred as `0217`, extended by `0240`
   (pool, submit-by-buffer, Metal properties); device registration pending.
-- **Metal plug-in:** not started.
+- **Metal plug-in:** source added in `userland/plugin/` (MTLDevice, buffers,
+  queue, blit/compute, AIR -> ir3); macOS build and device run pending.
 
 ## Related repositories
 
@@ -100,6 +104,7 @@ firmware/   GPU firmware taken from the phone's own ROM (not committed)
 tools/      scripts (firmware extraction, DTB reading, table generation)
 kernel/     snapshots of the XNU chip driver (whyred_gpu.c) and IOKit service (WhyredGPU.cpp)
 userland/   A5xx register/packet layer, fake CP, host tests
+userland/plugin/  WhyredMetal.bundle sources, build script, hakios compiler
 notes/      working notes
 ```
 

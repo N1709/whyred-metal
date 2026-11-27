@@ -1,0 +1,2655 @@
+/*
+ * WhyredMetal: the plug-in Metal loads when the kernel service names it (M5.1, M5.2).
+ *
+ * How Metal finds a device (the system's own code, MTLRegisterDevices): it matches the IOKit class IOAcceleratorES, reads the
+ * service's MetalPluginName ("WhyredMetal") and MetalPluginClassName ("WhyredMetalDevice"), opens
+ * /System/Library/Extensions/WhyredMetal.bundle, takes that class, insists that it is a subclass of Metal's private
+ * _MTLDevice that conforms to MTLDevice and MTLDeviceSPI, and sends it -initWithAcceleratorPort:.
+ *
+ * M5.2 adds the objects a program uses to move bytes with the GPU:
+ *   buffers          memory the kernel service hands out (physically contiguous, below 4 GB, mapped into the process), so the
+ *                    CPU sees it through -contents and the GPU addresses it through -gpuAddress
+ *   command queue    -newCommandQueue, -commandBuffer
+ *   command buffer   -blitCommandEncoder, -commit, -waitUntilCompleted, completed handlers, -status
+ *   blit encoder     -fillBuffer:range:value: (the GPU's command processor writes the words: CP_MEM_WRITE) and
+ *                    -copyFromBuffer:... (the 2D core blits the 64-byte aligned middle, the same CP_BLIT sequence as the kernel's
+ *                    step 18; an unaligned head and tail are copied by the CPU and counted in the log)
+ * A command buffer runs when it is committed, op by op, each op one synchronous submission to the service.
+ *
+ * Everything Metal sends that nothing implements is answered with zero and written once to /var/root/whyredmetal.log
+ * ("asked and not implemented"); the return type is read from the protocols the class declares, so structs come back sized.
+ *
+ * _MTLDevice and the other bases are not in the SDK (they live in the system's Metal.framework), so the classes are made at run
+ * time, in the constructor that runs when the bundle is loaded. Built without ARC.
+ */
+#import <Foundation/Foundation.h>
+#import <IOSurface/IOSurfaceRef.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#include <IOKit/IOKitLib.h>
+#include "why5.h"
+#include "whycc.h"
+#include <Block.h>
+#include <mach/mach.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#define WHY_LOG "/var/root/whyredmetal.log"
+#define WHY_LOG_FALLBACK "/var/tmp/whyredmetal.log"
+
+static int gWhyVerbose = -1;
+
+static int
+whyVerbose(void)
+{
+	if (gWhyVerbose < 0) {
+		const char * e = getenv("WHYREDMETAL_VERBOSE");
+		gWhyVerbose = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+	}
+	return gWhyVerbose;
+}
+
+static void
+whylog(const char * fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	FILE * f;
+
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	f = fopen(WHY_LOG, "a");
+	if (f == NULL) {
+		f = fopen(WHY_LOG_FALLBACK, "a");
+	}
+	if (f != NULL) {
+		fprintf(f, "%ld WhyredMetal[%d]: %s\n", (long)time(NULL), (int)getpid(), line);
+		fclose(f);
+	}
+	NSLog(@"WhyredMetal: %s", line);
+}
+
+#define whydbg(...) do { if (whyVerbose()) whylog(__VA_ARGS__); } while (0)
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* The service: WhyredGPU (kernel/WhyredGPU.cpp). Buffers, and streams of PM4 words submitted by reference.         */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+enum { kWhyInfo = 0, kWhyBufNew = 1, kWhyBufFree = 2, kWhySubmit = 3, kWhySubmitBuf = 4, kWhyMetal = 5 };
+
+struct why_buf_new { uint64_t size; uint32_t handle, pad; uint64_t address; };
+struct why_buf_free { uint32_t handle, pad; };
+struct why_submit_out { uint32_t fence, status; };
+struct why_submit_buf { uint32_t handle, offset, dwords, pad; };
+
+struct lbuf {
+	uint32_t handle;
+	int32_t slab;                   /* -1: a buffer of the service of its own; else the slab it is carved from */
+	uint32_t page, npages;          /* within the slab */
+	uint64_t gpu;                   /* the GPU's address (= physical, below 4 GB) */
+	void * cpu;                     /* the process's mapping */
+	size_t len;
+	mach_vm_address_t map;
+};
+
+static io_connect_t gConn;
+static struct lbuf gStream;         /* [0, 16 KB): the PM4 words of a submission; [32 KB, 33 KB): scratch the GPU writes events to */
+static pthread_mutex_t gGPULock = PTHREAD_MUTEX_INITIALIZER;
+
+#define STREAM_WORDS    4096u
+#define SCRATCH_OFFSET  0x8000u
+
+static BOOL
+whyBufNewDirect(size_t len, struct lbuf * b)
+{
+	struct why_buf_new bn;
+	size_t out = sizeof(bn);
+	mach_vm_size_t msize = 0;
+	kern_return_t kr;
+
+	memset(&bn, 0, sizeof(bn));
+	bn.size = len;
+	kr = IOConnectCallStructMethod(gConn, kWhyBufNew, &bn, sizeof(bn), &bn, &out);
+	if (kr != KERN_SUCCESS) {
+		whylog("buffer of %zu bytes: kr %#x", len, kr);
+		return NO;
+	}
+	b->handle = bn.handle;
+	b->slab = -1;
+	b->gpu = bn.address;
+	b->len = (size_t)bn.size;
+	b->map = 0;
+	kr = IOConnectMapMemory64(gConn, bn.handle, mach_task_self(), &b->map, &msize, kIOMapAnywhere);
+	if (kr != KERN_SUCCESS) {
+		struct why_buf_free bf = { bn.handle, 0 };
+
+		whylog("map of buffer %u: kr %#x", bn.handle, kr);
+		IOConnectCallStructMethod(gConn, kWhyBufFree, &bf, sizeof(bf), NULL, NULL);
+		return NO;
+	}
+	b->cpu = (void *)(uintptr_t)b->map;
+	return YES;
+}
+
+static void
+whyBufFreeDirect(struct lbuf * b)
+{
+	struct why_buf_free bf = { b->handle, 0 };
+
+	if (b->handle == 0) {
+		return;
+	}
+	IOConnectUnmapMemory64(gConn, b->handle, mach_task_self(), b->map);
+	IOConnectCallStructMethod(gConn, kWhyBufFree, &bf, sizeof(bf), NULL, NULL);
+	memset(b, 0, sizeof(*b));
+}
+
+/*
+ * The service holds 64 buffers for every process, and CoreAnimation wants hundreds (each texture, buffer and pipeline takes one), so
+ * the plug-in asks the service for a few big slabs and carves its buffers out of them, a page (4 KB) at a time. A request of half a
+ * slab or more still gets a buffer of its own. Everything a slab hands out is zeroed, as a service buffer is.
+ */
+#define POOL_PAGE       4096u
+#define POOL_MAX_SLABS  48
+#define POOL_SLAB_BYTES (8u << 20)
+
+struct slab {
+	struct lbuf big;
+	uint8_t * used;                 /* one byte per page */
+	uint32_t npages;
+};
+
+static struct slab gSlabs[POOL_MAX_SLABS];
+static pthread_mutex_t gPoolLock = PTHREAD_MUTEX_INITIALIZER;
+
+/* the first run of NPAGES free pages in the slab, or -1 */
+static int64_t
+slabFind(const struct slab * sl, uint32_t npages)
+{
+	uint32_t run = 0;
+
+	for (uint32_t i = 0; i < sl->npages; i++) {
+		run = sl->used[i] ? 0 : run + 1;
+		if (run == npages) {
+			return (int64_t)i + 1 - npages;
+		}
+	}
+	return -1;
+}
+
+static BOOL
+slabAdd(void)
+{
+	/* physically contiguous memory below 4 GB is scarce on this port (the service answers kIOReturnNoMemory for 8 MB, 2 MB, soon
+	 * for 512 KB): start from the biggest slab that was last possible and only go down */
+	static const size_t sizes[5] = { POOL_SLAB_BYTES, 2u << 20, 512u << 10, 128u << 10, 32u << 10 };
+	static int first;
+
+	for (int i = 0; i < POOL_MAX_SLABS; i++) {
+		if (gSlabs[i].big.handle != 0) {
+			continue;
+		}
+		for (int k = first; k < 5; k++) {
+			if (whyBufNewDirect(sizes[k], &gSlabs[i].big)) {
+				first = k;
+				gSlabs[i].npages = (uint32_t)(gSlabs[i].big.len / POOL_PAGE);
+				gSlabs[i].used = calloc(gSlabs[i].npages, 1);
+				whylog("slab %d: %zu bytes at GPU %#llx", i, gSlabs[i].big.len, (unsigned long long)gSlabs[i].big.gpu);
+				return gSlabs[i].used != NULL;
+			}
+		}
+		return NO;
+	}
+	return NO;
+}
+
+static BOOL
+whyBufNew(size_t len, struct lbuf * b)
+{
+	uint32_t npages = (uint32_t)((len + POOL_PAGE - 1) / POOL_PAGE);
+
+	memset(b, 0, sizeof(*b));
+	if (npages == 0) {
+		npages = 1;
+	}
+	if ((size_t)npages * POOL_PAGE >= POOL_SLAB_BYTES / 2 || gConn == 0 || gStream.handle == 0) {
+		/* big (or the stream buffer, made before the pool is usable): its own */
+		return whyBufNewDirect((size_t)npages * POOL_PAGE, b);
+	}
+	pthread_mutex_lock(&gPoolLock);
+	for (int attempt = 0; attempt < 2; attempt++) {
+		for (int i = 0; i < POOL_MAX_SLABS; i++) {
+			struct slab * sl = &gSlabs[i];
+			int64_t at;
+
+			if (sl->big.handle == 0 || sl->npages < npages || (at = slabFind(sl, npages)) < 0) {
+				continue;
+			}
+			memset(sl->used + at, 1, npages);
+			b->handle = sl->big.handle;
+			b->slab = i;
+			b->page = (uint32_t)at;
+			b->npages = npages;
+			b->gpu = sl->big.gpu + (uint64_t)at * POOL_PAGE;
+			b->cpu = (uint8_t *)sl->big.cpu + (size_t)at * POOL_PAGE;
+			b->len = (size_t)npages * POOL_PAGE;
+			b->map = 0;
+			pthread_mutex_unlock(&gPoolLock);
+			memset(b->cpu, 0, b->len);
+			return YES;
+		}
+		if (attempt == 0 && !slabAdd()) {
+			break;
+		}
+	}
+	pthread_mutex_unlock(&gPoolLock);
+	/* the slabs could not grow (or the request is bigger than a slab of the size that was left): try a buffer of its own */
+	return whyBufNewDirect((size_t)npages * POOL_PAGE, b);
+}
+
+static void
+whyBufFree(struct lbuf * b)
+{
+	if (b->handle == 0) {
+		return;
+	}
+	if (b->slab >= 0) {
+		pthread_mutex_lock(&gPoolLock);
+		memset(gSlabs[b->slab].used + b->page, 0, b->npages);
+		pthread_mutex_unlock(&gPoolLock);
+		memset(b, 0, sizeof(*b));
+		return;
+	}
+	whyBufFreeDirect(b);
+}
+
+static BOOL
+whyOpen(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("WhyredGPU"));
+		kern_return_t kr;
+
+		if (service == 0) {
+			whylog("no WhyredGPU service");
+			return;
+		}
+		kr = IOServiceOpen(service, mach_task_self(), 0, &gConn);
+		IOObjectRelease(service);
+		if (kr != KERN_SUCCESS) {
+			whylog("IOServiceOpen: kr %#x", kr);
+			gConn = 0;
+			return;
+		}
+		if (!whyBufNewDirect(65536, &gStream)) {
+			gConn = 0;
+			return;
+		}
+		memset(gStream.cpu, 0, gStream.len);
+		whylog("the GPU service is open; stream buffer at GPU %#llx", (unsigned long long)gStream.gpu);
+	});
+	return gConn != 0 && gStream.handle != 0;
+}
+
+/* One synchronous submission: the words go into the stream buffer and the service reads them from there. */
+static BOOL
+whySubmit(const uint32_t * words, size_t count)
+{
+	struct why_submit_buf sb = { gStream.handle, 0, (uint32_t)count, 0 };
+	struct why_submit_out out = { 0, 0 };
+	size_t outsize = sizeof(out);
+	kern_return_t kr;
+
+	if (count == 0 || count > STREAM_WORDS) {
+		return NO;
+	}
+	memcpy(gStream.cpu, words, count * 4);
+	kr = IOConnectCallStructMethod(gConn, kWhySubmitBuf, &sb, sizeof(sb), &out, &outsize);
+	if (kr != KERN_SUCCESS || out.fence == 0) {
+		whylog("submit of %zu words: kr %#x fence %u status %u", count, kr, out.fence, out.status);
+		return NO;
+	}
+	return YES;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* PM4 streams                                                                                                         */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+static uint32_t
+parity(uint32_t v)
+{
+	v ^= v >> 16;
+	v ^= v >> 8;
+	v ^= v >> 4;
+	return (0x9669u >> (v & 0xf)) & 1u;
+}
+
+struct stream {
+	uint32_t w[STREAM_WORDS];
+	size_t n;
+};
+
+static void
+put(struct stream * s, uint32_t v)
+{
+	if (s->n < STREAM_WORDS) {
+		s->w[s->n++] = v;
+	}
+}
+
+static void
+pkt7(struct stream * s, uint32_t opcode, uint32_t cnt)
+{
+	put(s, 0x70000000u | (cnt & 0x3fff) | (parity(cnt) << 15) | ((opcode & 0x7f) << 16) | (parity(opcode) << 23));
+}
+
+static void
+pkt4(struct stream * s, uint32_t reg, uint32_t cnt)
+{
+	put(s, 0x40000000u | cnt | (parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (parity(reg & 0x3ffffu) << 27));
+}
+
+static void
+reg1(struct stream * s, uint32_t reg, uint32_t v)
+{
+	pkt4(s, reg, 1);
+	put(s, v);
+}
+
+#define CP_MEM_WRITE            61u
+#define CP_SET_RENDER_MODE      0x6cu
+#define CP_BLIT                 0x2cu
+#define CP_WAIT_FOR_IDLE        38u
+#define CP_EVENT_WRITE          0x46u
+
+/* a run of words written by the command processor at `gpu` (a multiple of 4), at most 1000 words a packet */
+static void
+emitWrite(struct stream * s, uint64_t gpu, const uint32_t * words, size_t count)
+{
+	while (count > 0) {
+		size_t k = count > 1000 ? 1000 : count;
+
+		pkt7(s, CP_MEM_WRITE, (uint32_t)(2 + k));
+		put(s, (uint32_t)gpu);
+		put(s, (uint32_t)(gpu >> 32));
+		for (size_t i = 0; i < k; i++) {
+			put(s, words[i]);
+		}
+		words += k;
+		gpu += k * 4;
+		count -= k;
+	}
+}
+
+/* the 2D core's state, as the kernel's step 18 sets it (emit_setup) */
+static void
+emit2DSetup(struct stream * s)
+{
+	reg1(s, 0xe141u, 0x8);                  /* RB_RENDER_CNTL */
+	reg1(s, 0x2100u, 0x86000000u);          /* RB_2D_BLIT_CNTL */
+	reg1(s, 0x2180u, 0x86000000u);          /* GRAS_2D_BLIT_CNTL */
+	reg1(s, 0x2184u, 0x9);
+	reg1(s, 0xe140u, 1u << 17);             /* RB_CNTL: BYPASS */
+	reg1(s, 0x0cc6u, 1u << 1);              /* RB_MODE_CNTL */
+	reg1(s, 0x0ec3u, 0xc);                  /* SP_MODE_CNTL */
+	reg1(s, 0x0e22u, 0x244u | (1u << 7));   /* TPL1_MODE_CNTL */
+	reg1(s, 0x0e04u, 0x2);                  /* HLSQ_MODE_CNTL */
+	reg1(s, 0xe000u, 0x181);                /* GRAS_CL_CNTL */
+}
+
+/* a linear byte copy as an R8 "image" of one row: n is a multiple of 64, src and dst 64-byte aligned */
+static void
+emitBlit(struct stream * s, uint64_t src, uint64_t dst, uint32_t n)
+{
+	uint32_t pitch = n >> 6;
+
+	pkt7(s, CP_SET_RENDER_MODE, 1);
+	put(s, 5);                              /* BLIT2D */
+	pkt4(s, 0x2107u, 9);                    /* RB_2D_SRC_INFO .. */
+	put(s, 0x3);
+	put(s, (uint32_t)src);
+	put(s, (uint32_t)(src >> 32));
+	put(s, pitch | ((pitch * 2) << 16));
+	for (int i = 0; i < 5; i++) {
+		put(s, 0);
+	}
+	reg1(s, 0x2181u, 0x3);                  /* GRAS_2D_SRC_INFO */
+	pkt4(s, 0x2110u, 9);                    /* RB_2D_DST_INFO .. */
+	put(s, 0x3);
+	put(s, (uint32_t)dst);
+	put(s, (uint32_t)(dst >> 32));
+	put(s, pitch | ((pitch * 2) << 16));
+	for (int i = 0; i < 5; i++) {
+		put(s, 0);
+	}
+	reg1(s, 0x2182u, 0x3);                  /* GRAS_2D_DST_INFO */
+	pkt4(s, 0x2000u, 5);                    /* TPL1_A2D_SRC_TEXTURE_INFO .. */
+	put(s, 0x3);
+	put(s, n | (1u << 15));                 /* width n, height 1 */
+	put(s, (uint32_t)src);
+	put(s, (uint32_t)(src >> 32));
+	put(s, pitch << 9);
+	reg1(s, 0x2040u, 0x3u << 3);            /* SP_A2D_OUTPUT_INFO */
+	pkt7(s, CP_BLIT, 5);
+	put(s, 3);                              /* BLIT_OP_SCALE */
+	put(s, 0);
+	put(s, n - 1);
+	put(s, 0);
+	put(s, n - 1);
+}
+
+/* the end of a run of 2D blits: leave the 2D mode and push the colour cache out to memory */
+static void
+emit2DEnd(struct stream * s, uint32_t token)
+{
+	uint64_t flag = gStream.gpu + SCRATCH_OFFSET;
+
+	pkt7(s, CP_SET_RENDER_MODE, 1);
+	put(s, 8);                              /* END2D */
+	pkt7(s, CP_WAIT_FOR_IDLE, 0);
+	pkt7(s, CP_EVENT_WRITE, 4);
+	put(s, 0x1du | (1u << 30));             /* PC_CCU_FLUSH_COLOR_TS */
+	put(s, (uint32_t)flag);
+	put(s, (uint32_t)(flag >> 32));
+	put(s, token);
+	pkt7(s, CP_WAIT_FOR_IDLE, 0);
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* Metal's classes. Protocol-driven signatures: a message nobody implements is logged once and answered with zeros.     */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+static Class gDeviceBase;
+static id gDevice;
+static unsigned int gPort;
+static Protocol * gProtocols[96];
+static unsigned gProtocolCount;
+static Class gBufferClass, gQueueClass, gCommandBufferClass, gBlitClass;
+static Class gTextureClass, gRenderPipeClass, gRenderClass, gSamplerClass;
+
+static void
+keepProtocol(Protocol * p)
+{
+	if (gProtocolCount < sizeof(gProtocols) / sizeof(gProtocols[0])) {
+		gProtocols[gProtocolCount++] = p;
+	}
+}
+
+/* the protocol and Metal's private one of the same name (MTLBufferSPI ...), where this system has it */
+static void
+declareNamed(Class cls, const char * const * names)
+{
+	char spi[96];
+
+	for (; *names != NULL; names++) {
+		for (int private = 0; private < 2; private++) {
+			Protocol * p;
+
+			snprintf(spi, sizeof(spi), "%s%s", *names, private ? "SPI" : "");
+			if ((p = objc_getProtocol(spi)) != NULL) {
+				class_addProtocol(cls, p);
+				keepProtocol(p);
+			}
+		}
+	}
+}
+
+/* every protocol whose name begins with `prefix` (for the device and the queue, which have several private ones) */
+static void
+declareFamily(Class cls, const char * prefix)
+{
+	unsigned int count = 0;
+	Protocol * __unsafe_unretained * all = objc_copyProtocolList(&count);
+
+	for (unsigned int i = 0; i < count; i++) {
+		if (strncmp(protocol_getName(all[i]), prefix, strlen(prefix)) == 0) {
+			class_addProtocol(cls, all[i]);
+			keepProtocol(all[i]);
+		}
+	}
+	free(all);
+}
+
+static id
+stubSignature(id self, SEL _cmd, SEL selector)
+{
+	for (unsigned i = 0; i < gProtocolCount; i++) {
+		for (int required = 1; required >= 0; required--) {
+			struct objc_method_description d = protocol_getMethodDescription(gProtocols[i], selector, required, YES);
+
+			if (d.name != NULL && d.types != NULL) {
+				return ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSMethodSignature"),
+				    sel_registerName("signatureWithObjCTypes:"), d.types);
+			}
+		}
+	}
+	struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
+
+	id sig;
+
+	(void)_cmd;
+	sig = ((id (*)(struct objc_super *, SEL, SEL))objc_msgSendSuper)(&sup, sel_registerName("methodSignatureForSelector:"), selector);
+	if (sig == nil) {
+		/* a selector no protocol declares (Metal's SPI): answered with an 8-byte zero rather than an exception, and logged */
+		whylog("unknown selector -%s on %s: answered with zero", sel_getName(selector), class_getName(object_getClass(self)));
+		sig = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSMethodSignature"),
+		    sel_registerName("signatureWithObjCTypes:"), "Q@:");
+	}
+	return sig;
+}
+
+static void
+stubForward(id self, SEL _cmd, id invocation)
+{
+	static NSMutableSet * seen;
+	SEL selector = ((SEL (*)(id, SEL))objc_msgSend)(invocation, sel_registerName("selector"));
+	id signature = ((id (*)(id, SEL))objc_msgSend)(invocation, sel_registerName("methodSignature"));
+	NSUInteger length = ((NSUInteger (*)(id, SEL))objc_msgSend)(signature, sel_registerName("methodReturnLength"));
+	NSString * name = NSStringFromSelector(selector);
+
+	(void)_cmd;
+	@synchronized(gDeviceBase) {
+		if (seen == nil) {
+			seen = [NSMutableSet new];
+		}
+		if (![seen containsObject:name]) {
+			[seen addObject:name];
+			whylog("asked and not implemented: -%s (%s; returns %lu bytes, answered with zero)", [name UTF8String],
+			    class_getName(object_getClass(self)), (unsigned long)length);
+		}
+	}
+	if (length != 0) {
+		void * zero = calloc(1, length);
+
+		((void (*)(id, SEL, void *))objc_msgSend)(invocation, sel_registerName("setReturnValue:"), zero);
+		free(zero);
+	}
+}
+
+static void
+addStubForwarding(Class cls)
+{
+	class_addMethod(cls, sel_registerName("methodSignatureForSelector:"), (IMP)stubSignature, "@@::");
+	class_addMethod(cls, sel_registerName("forwardInvocation:"), (IMP)stubForward, "v@:@");
+}
+
+/* each of our objects carries a block of state after its instance variables */
+#define STATE(self, type) ((type *)object_getIndexedIvars(self))
+
+static id
+makeObject(Class cls, size_t extra)
+{
+	id o = class_createInstance(cls, extra);
+
+	if (o != nil) {
+		o = ((id (*)(id, SEL))objc_msgSend)(o, sel_registerName("init"));
+	}
+	return o;
+}
+
+static id
+objDevice(__unused id self, __unused SEL _cmd)
+{
+	return gDevice;
+}
+
+/* ---- buffers ---- */
+
+struct bufstate {
+	struct lbuf b;
+	uint64_t options;
+	id label;
+	void * nocopyPtr;
+	uint64_t nocopyLen;
+	void (^deallocator)(void *, NSUInteger);
+};
+
+static id
+deviceNewBuffer(__unused id self, __unused SEL _cmd, uint64_t length, uint64_t options)
+{
+	id o;
+	struct bufstate * st;
+	BOOL ok;
+
+	if (length == 0 || length > (16ull << 20) || !whyOpen()) {
+		whylog("newBufferWithLength:%llu refused", (unsigned long long)length);
+		return nil;
+	}
+	o = makeObject(gBufferClass, sizeof(struct bufstate));
+	if (o == nil) {
+		return nil;
+	}
+	st = STATE(o, struct bufstate);
+	memset(st, 0, sizeof(*st));
+	pthread_mutex_lock(&gGPULock);
+	ok = whyBufNew((size_t)length, &st->b);
+	pthread_mutex_unlock(&gGPULock);
+	if (!ok) {
+		return nil;
+	}
+	memset(st->b.cpu, 0, st->b.len);
+	st->options = options;
+	return o;
+}
+
+static id
+deviceNewBufferBytes(id self, SEL _cmd, const void * bytes, uint64_t length, uint64_t options)
+{
+	id o = deviceNewBuffer(self, _cmd, length, options);
+
+	if (o != nil && bytes != NULL) {
+		memcpy(STATE(o, struct bufstate)->b.cpu, bytes, (size_t)length);
+	}
+	return o;
+}
+
+static id
+deviceNewBufferNoCopy(id self, SEL _cmd, void * bytes, uint64_t length, uint64_t options,
+    void (^deallocator)(void *, NSUInteger))
+{
+	id o = deviceNewBuffer(self, _cmd, length, options);
+
+	if (o != nil) {
+		struct bufstate * st = STATE(o, struct bufstate);
+
+		if (bytes != NULL && length != 0) {
+			memcpy(st->b.cpu, bytes, (size_t)length);
+		}
+		st->nocopyPtr = bytes;
+		st->nocopyLen = length;
+		if (deallocator != NULL) {
+			st->deallocator = Block_copy(deallocator);
+		}
+	}
+	return o;
+}
+
+static void
+bufferDealloc(id self, __unused SEL _cmd)
+{
+	struct bufstate * st = STATE(self, struct bufstate);
+	struct objc_super sup = { self, class_getSuperclass(gBufferClass) };
+
+	pthread_mutex_lock(&gGPULock);
+	whyBufFree(&st->b);
+	pthread_mutex_unlock(&gGPULock);
+	if (st->deallocator != NULL) {
+		st->deallocator(st->nocopyPtr, (NSUInteger)st->nocopyLen);
+		Block_release(st->deallocator);
+		st->deallocator = NULL;
+	}
+	[st->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static void *
+bufferContents(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct bufstate)->b.cpu;
+}
+
+static uint64_t
+bufferLength(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct bufstate)->b.len;
+}
+
+static uint64_t
+bufferOptions(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct bufstate)->options;
+}
+
+static uint64_t
+bufferStorageMode(id self, __unused SEL _cmd)
+{
+	return (STATE(self, struct bufstate)->options >> 4) & 0xf;
+}
+
+static uint64_t
+bufferCacheMode(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct bufstate)->options & 0xf;
+}
+
+static uint64_t
+bufferHazardMode(id self, __unused SEL _cmd)
+{
+	return (STATE(self, struct bufstate)->options >> 8) & 0x3;
+}
+
+static uint64_t
+bufferGPUAddress(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct bufstate)->b.gpu;
+}
+
+static void
+bufferDidModify(__unused id self, __unused SEL _cmd, __unused NSRange r)
+{
+}
+
+static uint64_t
+bufferPurgeable(__unused id self, __unused SEL _cmd, __unused uint64_t state)
+{
+	return 1;                               /* MTLPurgeableStateNonVolatile */
+}
+
+static id
+bufferLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct bufstate)->label;
+}
+
+static void
+bufferSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct bufstate * st = STATE(self, struct bufstate);
+
+	[st->label release];
+	st->label = [label copy];
+}
+
+/* ---- queue, command buffer, blit encoder ---- */
+
+enum opkind { OP_FILL, OP_COPY, OP_COPY_TEX, OP_DISPATCH, OP_CLEAR, OP_DRAW };
+
+typedef struct { uint64_t x, y, z; } WhyOrigin;
+typedef struct { uint64_t width, height, depth; } WhySize;
+
+struct copytex {
+	id src, dst;
+	uint64_t sx, sy, dx, dy, w, h, slevel, dlevel;
+};
+
+/* a compute dispatch as the encoder had it when it was encoded: the pipeline, what is bound, the grid */
+struct dispatch {
+	id pipeline;                            /* retained */
+	id buf[WHY5_MAX_BUFFERS];               /* retained */
+	uint64_t off[WHY5_MAX_BUFFERS];
+	uint8_t * bytes[WHY5_MAX_BUFFERS];      /* setBytes:, a copy */
+	uint32_t blen[WHY5_MAX_BUFFERS];
+	uint32_t groups[3], local[3];
+};
+
+/* a draw as the render encoder had it when it was encoded */
+struct draw {
+	id pipeline;                            /* retained */
+	id target;                              /* retained texture */
+	id xtarget[8];                          /* retained: colour targets 1.. */
+	id vbuf[WHY5_MAX_BUFFERS];              /* retained: setVertexBuffer: */
+	uint64_t voff[WHY5_MAX_BUFFERS];
+	uint8_t * vbytes[WHY5_MAX_BUFFERS];     /* setVertexBytes:, a copy */
+	uint32_t vblen[WHY5_MAX_BUFFERS];
+	id fbuf[WHY5_MAX_BUFFERS];
+	uint64_t foff[WHY5_MAX_BUFFERS];
+	uint8_t * fbytes[WHY5_MAX_BUFFERS];
+	uint32_t fblen[WHY5_MAX_BUFFERS];
+	uint32_t prim, first, count, instances, base_instance;
+	id ibuf;                                /* retained: the index buffer of an indexed draw */
+	uint64_t ioff;
+	uint32_t isize;                         /* 0 not indexed, 1 16-bit, 2 32-bit */
+	float viewport[6];
+	uint32_t scissor[4];
+	uint32_t cull, front_cw;
+	id ftex[16], fsamp[16];                 /* retained */
+	float blend_color[4];
+};
+
+struct op {
+	enum opkind kind;
+	struct draw * draw;
+	struct copytex * copytex;
+	double clear[4];
+	id src, dst;                    /* retained buffers */
+	uint64_t srcOff, dstOff, size;
+	uint8_t value;
+	struct dispatch * disp;
+};
+
+struct cbstate {
+	id queue;
+	NSMutableArray * handlers;
+	NSMutableArray * scheduled;
+	NSMutableArray * drawables;     /* presentDrawable: */
+	struct op * ops;
+	size_t nops, cap;
+	int status;                     /* MTLCommandBufferStatus */
+	id label;
+};
+
+struct encstate {
+	id commandBuffer;
+	BOOL ended;
+	id label;
+};
+
+static id
+deviceNewQueue(__unused id self, __unused SEL _cmd)
+{
+	if (!whyOpen()) {
+		return nil;
+	}
+	return makeObject(gQueueClass, 0);
+}
+
+static id
+deviceNewQueueMax(id self, SEL _cmd, __unused uint64_t max)
+{
+	return deviceNewQueue(self, _cmd);
+}
+
+static id
+queueCommandBuffer(id self, __unused SEL _cmd)
+{
+	id o = makeObject(gCommandBufferClass, sizeof(struct cbstate));
+	struct cbstate * st;
+
+	if (o == nil) {
+		return nil;
+	}
+	st = STATE(o, struct cbstate);
+	memset(st, 0, sizeof(*st));
+	st->queue = [self retain];
+	st->handlers = [NSMutableArray new];
+	st->scheduled = [NSMutableArray new];
+	st->status = 1;                         /* Enqueued */
+	return [o autorelease];                 /* not a new/copy method: the caller owns nothing */
+}
+
+/* _MTLCommandQueue's own dealloc releases a dispatch queue this object never made (-> dispatch_release(NULL)): skip it,
+ * go to the class above it */
+static void
+queueDealloc(id self, __unused SEL _cmd)
+{
+	struct objc_super sup = { self, class_getSuperclass(class_getSuperclass(gQueueClass)) };
+
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static id
+queueLabel(__unused id self, __unused SEL _cmd)
+{
+	return nil;
+}
+
+/* MTLCommandQueueSPI, which CARenderer calls: completion handlers run on the thread that finishes the command buffer here, so the
+ * queue given is accepted and not used */
+static void
+queueSetCompletionQueue(__unused id self, __unused SEL _cmd, __unused id q)
+{
+}
+
+static id
+queueCompletionQueue(__unused id self, __unused SEL _cmd)
+{
+	return nil;
+}
+
+static void
+cbFreeOps(struct cbstate * st)
+{
+	for (size_t i = 0; i < st->nops; i++) {
+		[st->ops[i].src release];
+		[st->ops[i].dst release];
+		if (st->ops[i].draw != NULL) {
+			struct draw * w = st->ops[i].draw;
+
+			[w->ibuf release];
+
+			[w->pipeline release];
+			[w->target release];
+			for (int j = 1; j < 8; j++) {
+				[w->xtarget[j] release];
+			}
+			for (int j = 0; j < 16; j++) {
+				[w->ftex[j] release];
+				[w->fsamp[j] release];
+			}
+			for (int j = 0; j < WHY5_MAX_BUFFERS; j++) {
+				[w->vbuf[j] release];
+				[w->fbuf[j] release];
+				free(w->vbytes[j]);
+				free(w->fbytes[j]);
+			}
+			free(w);
+		}
+		if (st->ops[i].copytex != NULL) {
+			[st->ops[i].copytex->src release];
+			[st->ops[i].copytex->dst release];
+			free(st->ops[i].copytex);
+		}
+		if (st->ops[i].disp != NULL) {
+			struct dispatch * d = st->ops[i].disp;
+
+			[d->pipeline release];
+			for (int j = 0; j < WHY5_MAX_BUFFERS; j++) {
+				[d->buf[j] release];
+				free(d->bytes[j]);
+			}
+			free(d);
+		}
+	}
+	free(st->ops);
+	st->ops = NULL;
+	st->nops = st->cap = 0;
+}
+
+static void
+cbDealloc(id self, __unused SEL _cmd)
+{
+	struct cbstate * st = STATE(self, struct cbstate);
+	struct objc_super sup = { self, class_getSuperclass(gCommandBufferClass) };
+
+	cbFreeOps(st);
+	[st->queue release];
+	[st->handlers release];
+	[st->scheduled release];
+	[st->drawables release];
+	[st->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static struct op *
+cbAddOp(struct cbstate * st)
+{
+	if (st->nops == st->cap) {
+		st->cap = st->cap ? st->cap * 2 : 16;
+		st->ops = realloc(st->ops, st->cap * sizeof(struct op));
+	}
+	memset(&st->ops[st->nops], 0, sizeof(struct op));
+	return &st->ops[st->nops++];
+}
+
+static id
+cbBlitEncoder(id self, __unused SEL _cmd)
+{
+	id e = makeObject(gBlitClass, sizeof(struct encstate));
+	struct encstate * es;
+
+	if (e == nil) {
+		return nil;
+	}
+	es = STATE(e, struct encstate);
+	memset(es, 0, sizeof(*es));
+	es->commandBuffer = [self retain];
+	return [e autorelease];
+}
+
+static void
+encDealloc(id self, __unused SEL _cmd)
+{
+	struct encstate * es = STATE(self, struct encstate);
+	struct objc_super sup = { self, class_getSuperclass(gBlitClass) };
+
+	[es->commandBuffer release];
+	[es->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static void
+encFill(id self, __unused SEL _cmd, id buffer, NSRange range, uint8_t value)
+{
+	struct cbstate * st = STATE(STATE(self, struct encstate)->commandBuffer, struct cbstate);
+	struct op * op = cbAddOp(st);
+
+	op->kind = OP_FILL;
+	op->dst = [buffer retain];
+	op->dstOff = range.location;
+	op->size = range.length;
+	op->value = value;
+}
+
+static void
+encCopy(id self, __unused SEL _cmd, id src, uint64_t srcOff, id dst, uint64_t dstOff, uint64_t size)
+{
+	struct cbstate * st = STATE(STATE(self, struct encstate)->commandBuffer, struct cbstate);
+	struct op * op = cbAddOp(st);
+
+	op->kind = OP_COPY;
+	op->src = [src retain];
+	op->dst = [dst retain];
+	op->srcOff = srcOff;
+	op->dstOff = dstOff;
+	op->size = size;
+}
+
+static void
+encCopyTex(id self, __unused SEL _cmd, id src, __unused uint64_t sslice, uint64_t slevel, WhyOrigin sorig,
+    WhySize ssize, id dst, __unused uint64_t dslice, uint64_t dlevel, WhyOrigin dorig)
+{
+	struct cbstate * st = STATE(STATE(self, struct encstate)->commandBuffer, struct cbstate);
+	struct op * op;
+	struct copytex * ct;
+
+	if (src == nil || dst == nil || ssize.width == 0 || ssize.height == 0) {
+		return;
+	}
+	op = cbAddOp(st);
+	ct = calloc(1, sizeof(*ct));
+	op->kind = OP_COPY_TEX;
+	op->copytex = ct;
+	ct->src = [src retain];
+	ct->dst = [dst retain];
+	ct->sx = sorig.x;
+	ct->sy = sorig.y;
+	ct->dx = dorig.x;
+	ct->dy = dorig.y;
+	ct->w = ssize.width;
+	ct->h = ssize.height;
+	ct->slevel = slevel;
+	ct->dlevel = dlevel;
+}
+
+static void
+encGenMips(__unused id self, __unused SEL _cmd, __unused id texture)
+{
+}
+
+static void
+encEnd(id self, __unused SEL _cmd)
+{
+	STATE(self, struct encstate)->ended = YES;
+}
+
+static void
+encNothing(__unused id self, __unused SEL _cmd, __unused id resource)
+{
+	/* synchronizeResource: the memory is the CPU's and the GPU's both; there is nothing to copy back */
+}
+
+static id
+encLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct encstate)->label;
+}
+
+static void
+encSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct encstate * es = STATE(self, struct encstate);
+
+	[es->label release];
+	es->label = [label copy];
+}
+
+/* run one op: the GPU does what it can, the CPU the unaligned edges */
+static BOOL
+runFill(struct op * op)
+{
+	struct bufstate * d = STATE(op->dst, struct bufstate);
+	uint8_t * cpu = (uint8_t *)d->b.cpu + op->dstOff;
+	uint64_t gpu = d->b.gpu + op->dstOff;
+	uint64_t size = op->size;
+	uint64_t head = (4 - (gpu & 3)) & 3;
+	uint64_t body, tail;
+	uint32_t pattern = op->value * 0x01010101u;
+
+	if (op->dstOff + size > d->b.len) {
+		whylog("fill beyond the buffer (%llu + %llu > %zu)", (unsigned long long)op->dstOff, (unsigned long long)size, d->b.len);
+		return NO;
+	}
+	if (head > size) {
+		head = size;
+	}
+	body = (size - head) & ~3ull;
+	tail = size - head - body;
+	if (head != 0 || tail != 0) {
+		whylog("fill: %llu head and %llu tail bytes by the CPU", (unsigned long long)head, (unsigned long long)tail);
+	}
+	memset(cpu, op->value, (size_t)head);
+	if (body != 0) {
+		struct stream * s = calloc(1, sizeof(*s));
+		uint32_t words[1000];
+
+		for (size_t i = 0; i < 1000; i++) {
+			words[i] = pattern;
+		}
+		for (uint64_t done = 0; done < body;) {
+			s->n = 0;
+			while (done < body && s->n + 1010 < STREAM_WORDS) {
+				size_t k = (size_t)((body - done) / 4);
+
+				if (k > 1000) {
+					k = 1000;
+				}
+				emitWrite(s, gpu + head + done, words, k);
+				done += k * 4;
+			}
+			if (!whySubmit(s->w, s->n)) {
+				free(s);
+				return NO;
+			}
+		}
+		free(s);
+	}
+	memset(cpu + head + body, op->value, (size_t)tail);
+	return YES;
+}
+
+#define BLIT_CHUNK 4096u
+
+static BOOL
+runCopy(struct op * op)
+{
+	struct bufstate * sb = STATE(op->src, struct bufstate);
+	struct bufstate * db = STATE(op->dst, struct bufstate);
+	uint8_t * scpu = (uint8_t *)sb->b.cpu + op->srcOff;
+	uint8_t * dcpu = (uint8_t *)db->b.cpu + op->dstOff;
+	uint64_t sgpu = sb->b.gpu + op->srcOff;
+	uint64_t dgpu = db->b.gpu + op->dstOff;
+	uint64_t size = op->size, head = 0, body = 0, tail = 0;
+
+	if (op->srcOff + size > sb->b.len || op->dstOff + size > db->b.len) {
+		whylog("copy beyond a buffer");
+		return NO;
+	}
+	if (((sgpu ^ dgpu) & 63) == 0) {
+		head = (64 - (dgpu & 63)) & 63;
+		if (head > size) {
+			head = size;
+		}
+		body = (size - head) & ~63ull;
+	}
+	tail = size - head - body;
+	if (body == 0) {
+		memmove(dcpu, scpu, (size_t)size);
+		whylog("copy of %llu bytes entirely by the CPU (too small or misaligned)", (unsigned long long)size);
+		return YES;
+	}
+	if (head != 0 || tail != 0) {
+		whylog("copy: %llu head and %llu tail bytes by the CPU", (unsigned long long)head, (unsigned long long)tail);
+	}
+	memmove(dcpu, scpu, (size_t)head);
+	{
+		struct stream * s = calloc(1, sizeof(*s));
+		uint64_t done = 0;
+		BOOL ok = YES;
+
+		while (done < body && ok) {
+			s->n = 0;
+			emit2DSetup(s);
+			while (done < body && s->n + 140 < STREAM_WORDS) {
+				uint32_t n = (uint32_t)((body - done) > BLIT_CHUNK ? BLIT_CHUNK : (body - done));
+
+				emitBlit(s, sgpu + head + done, dgpu + head + done, n);
+				done += n;
+			}
+			emit2DEnd(s, 0x2d2d0000u | (uint32_t)(done >> 6));
+			ok = whySubmit(s->w, s->n);
+		}
+		free(s);
+		if (!ok) {
+			return NO;
+		}
+	}
+	memmove(dcpu + head + body, scpu + head + body, (size_t)tail);
+	return YES;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* Compute: libraries, functions, pipeline states, the compute encoder (M5.3 step d)                                    */
+/* The shader compiler is hakios-metal's AIR front end and Mesa's ir3, in this process (whycc.cpp); the dispatch is     */
+/* why5.c's A5xx stream. A kernel it cannot serve (textures, threadgroup memory ...) is refused when its pipeline is    */
+/* made, by name, in the log.                                                                                           */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+static Class gLibraryClass, gFunctionClass, gPipelineClass, gComputeClass;
+static pthread_mutex_t gCCLock = PTHREAD_MUTEX_INITIALIZER;
+static struct lbuf gBytes;                  /* the bytes setBytes: gave, for the dispatch being run */
+
+struct libstate {
+	struct whycc_lib * lib;
+	uint64_t hash;                          /* of the metallib bytes: the key of the pipeline cache */
+	id label;
+};
+
+struct fnstate {
+	id library;                             /* retained */
+	NSString * name;
+	int type;                               /* the metallib's: 0 vertex, 1 fragment, 2 kernel */
+	struct whycc_fc * fcs;                  /* sorted by index */
+	uint32_t nfcs;
+	BOOL is_generic;
+	id label;
+};
+
+struct pipestate {
+	id function;                            /* retained */
+	struct why5_kernel k;
+	struct lbuf code;
+	id label;
+};
+
+struct cenc {
+	id commandBuffer;                       /* retained */
+	BOOL ended;
+	id label;
+	id pipeline;                            /* retained */
+	id buf[WHY5_MAX_BUFFERS];               /* retained */
+	uint64_t off[WHY5_MAX_BUFFERS];
+	uint8_t * bytes[WHY5_MAX_BUFFERS];
+	uint32_t blen[WHY5_MAX_BUFFERS];
+};
+
+/* WhySize defined above */
+
+static void
+whyError(NSError ** err, NSString * domain, const char * why)
+{
+	if (err != NULL) {
+		*err = [NSError errorWithDomain:domain code:1
+		    userInfo:@{ NSLocalizedDescriptionKey: [NSString stringWithUTF8String:why] }];
+	}
+}
+
+static uint64_t
+whyHash64(uint64_t h, const void * p, size_t n)
+{
+	const uint8_t * b = p;
+
+	for (size_t i = 0; i < n; i++) {
+		h = (h ^ b[i]) * 0x100000001b3ull;
+	}
+	return h;
+}
+
+static id
+makeLibrary(const void * bytes, size_t size, NSError ** err)
+{
+	char why[256] = "";
+	struct whycc_lib * lib;
+	id o;
+
+	pthread_mutex_lock(&gCCLock);
+	lib = whycc_open(bytes, size, why, sizeof(why));
+	pthread_mutex_unlock(&gCCLock);
+	if (lib == NULL) {
+		whylog("library of %zu bytes refused: %s", size, why);
+		whyError(err, @"MTLLibraryErrorDomain", why);
+		return nil;
+	}
+	o = makeObject(gLibraryClass, sizeof(struct libstate));
+	if (o == nil) {
+		whycc_close(lib);
+		return nil;
+	}
+	memset(STATE(o, struct libstate), 0, sizeof(struct libstate));
+	STATE(o, struct libstate)->lib = lib;
+	STATE(o, struct libstate)->hash = whyHash64(0xcbf29ce484222325ull, bytes, size);
+	whylog("library of %zu bytes, %u functions", size, whycc_function_count(lib));
+	return o;
+}
+
+static id
+deviceNewLibraryData(__unused id self, __unused SEL _cmd, id data, NSError ** err)
+{
+	const void * p = NULL;
+	size_t n = 0;
+	id map, lib;
+
+	if (data == nil) {
+		whyError(err, @"MTLLibraryErrorDomain", "no data");
+		return nil;
+	}
+	map = (id)dispatch_data_create_map((dispatch_data_t)data, &p, &n);
+	lib = makeLibrary(p, n, err);
+	[map release];
+	return lib;
+}
+
+static id
+deviceNewLibraryURL(__unused id self, __unused SEL _cmd, id url, NSError ** err)
+{
+	NSData * d = url != nil ? [NSData dataWithContentsOfURL:url] : nil;
+
+	if (d == nil) {
+		whyError(err, @"MTLLibraryErrorDomain", "the library file cannot be read");
+		return nil;
+	}
+	return makeLibrary([d bytes], [d length], err);
+}
+
+static id
+deviceNewPipelineLibrary(__unused id self, __unused SEL _cmd, id path, NSError ** err)
+{
+	whylog("newPipelineLibraryWithFilePath: %s: pipeline libraries are not supported", path != nil ? [[path description] UTF8String] : "(nil)");
+	whyError(err, @"MTLLibraryErrorDomain", "pipeline libraries are not supported");
+	return nil;
+}
+
+static id
+deviceNewLibraryFile(__unused id self, __unused SEL _cmd, id path, NSError ** err)
+{
+	NSData * d = path != nil ? [NSData dataWithContentsOfFile:path] : nil;
+
+	if (d == nil) {
+		whyError(err, @"MTLLibraryErrorDomain", "the library file cannot be read");
+		return nil;
+	}
+	return makeLibrary([d bytes], [d length], err);
+}
+
+static id
+deviceNewLibrarySource(__unused id self, __unused SEL _cmd, __unused id source, __unused id options, NSError ** err)
+{
+	whylog("newLibraryWithSource: there is no Metal source compiler on this device");
+	whyError(err, @"MTLLibraryErrorDomain", "this device has no Metal source compiler; give it a .metallib");
+	return nil;
+}
+
+static id
+deviceNoLibrary(__unused id self, __unused SEL _cmd)
+{
+	whylog("newDefaultLibrary: no default library");
+	return nil;
+}
+
+static id
+deviceNoLibraryBundle(__unused id self, __unused SEL _cmd, __unused id bundle, NSError ** err)
+{
+	whylog("newDefaultLibraryWithBundle: no default library");
+	whyError(err, @"MTLLibraryErrorDomain", "no default library");
+	return nil;
+}
+
+static void
+libDealloc(id self, __unused SEL _cmd)
+{
+	struct libstate * st = STATE(self, struct libstate);
+	struct objc_super sup = { self, class_getSuperclass(gLibraryClass) };
+
+	if (st->lib != NULL) {
+		whycc_close(st->lib);
+	}
+	[st->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static id
+libFunctionNames(id self, __unused SEL _cmd)
+{
+	struct whycc_lib * lib = STATE(self, struct libstate)->lib;
+	NSMutableArray * a = [NSMutableArray array];
+
+	for (unsigned i = 0; i < whycc_function_count(lib); i++) {
+		[a addObject:[NSString stringWithUTF8String:whycc_function_name(lib, i, NULL)]];
+	}
+	return a;
+}
+
+static id
+libNewFunction(id self, __unused SEL _cmd, id name)
+{
+	struct whycc_lib * lib = STATE(self, struct libstate)->lib;
+	id o;
+
+	for (unsigned i = 0; name != nil && i < whycc_function_count(lib); i++) {
+		int type = 0;
+		const char * n = whycc_function_name(lib, i, &type);
+
+		if (strcmp(n, [name UTF8String]) == 0) {
+			struct fnstate * fs;
+
+			o = makeObject(gFunctionClass, sizeof(struct fnstate));
+			if (o == nil) {
+				return nil;
+			}
+			fs = STATE(o, struct fnstate);
+			memset(fs, 0, sizeof(*fs));
+			fs->library = [self retain];
+			fs->name = [name copy];
+			fs->type = type;
+			return o;
+		}
+	}
+	whylog("newFunctionWithName:%s: not in the library", name != nil ? [name UTF8String] : "(nil)");
+	return nil;
+}
+
+static char gFCAssocKey;
+static char gFCNameAssocKey;
+static pthread_mutex_t gFCLock = PTHREAD_MUTEX_INITIALIZER;
+static void (*gOrigFCSetIndex)(id, SEL, const void *, uint64_t, uint64_t);
+static void (*gOrigFCSetRange)(id, SEL, const void *, uint64_t, NSRange);
+static void (*gOrigFCSetName)(id, SEL, const void *, uint64_t, id);
+static void (*gOrigFCReset)(id, SEL);
+static id (*gOrigFCCopy)(id, SEL, struct _NSZone *);
+
+static size_t
+mtlDataTypeBytes(uint64_t type)
+{
+	switch (type) {
+	case 53: case 45: case 49: return 1;            /* Bool, Char, UChar */
+	case 54: case 46: case 50: return 2;            /* Bool2, Char2, UChar2 */
+	case 55: case 47: case 51: return 3;            /* Bool3, Char3, UChar3 */
+	case 56: case 48: case 52: return 4;            /* Bool4, Char4, UChar4 */
+	case 37: case 41: case 16: return 2;            /* Short, UShort, Half */
+	case 38: case 42: case 17: return 4;            /* Short2, UShort2, Half2 */
+	case 39: case 43: case 18: return 6;            /* Short3, UShort3, Half3 */
+	case 40: case 44: case 19: return 8;            /* Short4, UShort4, Half4 */
+	case 29: case 33: case 3:  return 4;            /* Int, UInt, Float */
+	case 30: case 34: case 4:  return 8;            /* Int2, UInt2, Float2 */
+	case 121: case 125:        return 8;            /* Long, ULong */
+	default:                   return 0;
+	}
+}
+
+static uint64_t
+mtlDataTypeBits(const void * value, uint64_t type)
+{
+	size_t sz = mtlDataTypeBytes(type);
+	uint64_t bits = 0;
+
+	if (value == NULL || sz == 0 || sz > 8) {
+		return 0;
+	}
+	memcpy(&bits, value, sz);
+	if (type == 53) {
+		bits = (bits & 0xffu) ? 1ull : 0ull;
+	}
+	return bits;
+}
+
+static NSMutableDictionary *
+fcBagFor(id obj, BOOL create)
+{
+	NSMutableDictionary * d = objc_getAssociatedObject(obj, &gFCAssocKey);
+
+	if (d == nil && create) {
+		d = [[NSMutableDictionary alloc] init];
+		objc_setAssociatedObject(obj, &gFCAssocKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		[d release];
+	}
+	return d;
+}
+
+static void
+fcSetIndex(id self, SEL _cmd, const void * value, uint64_t type, uint64_t index)
+{
+	if (gOrigFCSetIndex != NULL) {
+		gOrigFCSetIndex(self, _cmd, value, type, index);
+	}
+	if (value != NULL && mtlDataTypeBytes(type) != 0) {
+		uint64_t bits = mtlDataTypeBits(value, type);
+
+		pthread_mutex_lock(&gFCLock);
+		NSMutableDictionary * d = fcBagFor(self, YES);
+		[d setObject:[NSNumber numberWithUnsignedLongLong:bits] forKey:[NSNumber numberWithUnsignedLongLong:index]];
+		pthread_mutex_unlock(&gFCLock);
+	}
+}
+
+static void
+fcSetRange(id self, SEL _cmd, const void * values, uint64_t type, NSRange range)
+{
+	if (gOrigFCSetRange != NULL) {
+		gOrigFCSetRange(self, _cmd, values, type, range);
+	}
+	size_t sz = mtlDataTypeBytes(type);
+	if (values != NULL && sz != 0 && range.length > 0 && range.length <= 1024) {
+		pthread_mutex_lock(&gFCLock);
+		NSMutableDictionary * d = fcBagFor(self, YES);
+		for (NSUInteger i = 0; i < range.length; i++) {
+			uint64_t bits = mtlDataTypeBits((const uint8_t *)values + i * sz, type);
+			[d setObject:[NSNumber numberWithUnsignedLongLong:bits]
+			    forKey:[NSNumber numberWithUnsignedLongLong:(uint64_t)(range.location + i)]];
+		}
+		pthread_mutex_unlock(&gFCLock);
+	}
+}
+
+static NSMutableDictionary *
+fcNameBagFor(id obj, BOOL create)
+{
+	NSMutableDictionary * d = objc_getAssociatedObject(obj, &gFCNameAssocKey);
+
+	if (d == nil && create) {
+		d = [[NSMutableDictionary alloc] init];
+		objc_setAssociatedObject(obj, &gFCNameAssocKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		[d release];
+	}
+	return d;
+}
+
+static void
+fcSetName(id self, SEL _cmd, const void * value, uint64_t type, id name)
+{
+	if (gOrigFCSetName != NULL) {
+		gOrigFCSetName(self, _cmd, value, type, name);
+	}
+	if (value != NULL && name != nil && mtlDataTypeBytes(type) != 0) {
+		uint64_t bits = mtlDataTypeBits(value, type);
+
+		pthread_mutex_lock(&gFCLock);
+		NSMutableDictionary * d = fcNameBagFor(self, YES);
+		[d setObject:[NSNumber numberWithUnsignedLongLong:bits] forKey:name];
+		pthread_mutex_unlock(&gFCLock);
+	}
+}
+
+static void
+fcReset(id self, SEL _cmd)
+{
+	if (gOrigFCReset != NULL) {
+		gOrigFCReset(self, _cmd);
+	}
+	pthread_mutex_lock(&gFCLock);
+	NSMutableDictionary * d = fcBagFor(self, NO);
+	NSMutableDictionary * dn = fcNameBagFor(self, NO);
+	[d removeAllObjects];
+	[dn removeAllObjects];
+	pthread_mutex_unlock(&gFCLock);
+}
+
+static id
+fcCopy(id self, SEL _cmd, struct _NSZone * zone)
+{
+	id copy = gOrigFCCopy != NULL ? gOrigFCCopy(self, _cmd, zone) : nil;
+
+	if (copy != nil) {
+		pthread_mutex_lock(&gFCLock);
+		NSMutableDictionary * d = fcBagFor(self, NO);
+		NSMutableDictionary * dn = fcNameBagFor(self, NO);
+		if (d != nil && [d count] > 0) {
+			NSMutableDictionary * cd = [d mutableCopy];
+			objc_setAssociatedObject(copy, &gFCAssocKey, cd, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+			[cd release];
+		}
+		if (dn != nil && [dn count] > 0) {
+			NSMutableDictionary * cdn = [dn mutableCopy];
+			objc_setAssociatedObject(copy, &gFCNameAssocKey, cdn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+			[cdn release];
+		}
+		pthread_mutex_unlock(&gFCLock);
+	}
+	return copy;
+}
+
+static void
+installFunctionConstantHooks(void)
+{
+	Class fcBase = objc_getClass("MTLFunctionConstantValues");
+	id sample = fcBase != Nil ? [[fcBase alloc] init] : nil;
+	Class cls = sample != nil ? object_getClass(sample) : objc_getClass("MTLFunctionConstantValuesInternal");
+
+	[sample release];
+	if (cls == Nil) {
+		whylog("no MTLFunctionConstantValues class to hook");
+		return;
+	}
+	Method m;
+	if ((m = class_getInstanceMethod(cls, sel_registerName("setConstantValue:type:atIndex:"))) != NULL) {
+		gOrigFCSetIndex = (void (*)(id, SEL, const void *, uint64_t, uint64_t))method_setImplementation(m, (IMP)fcSetIndex);
+	}
+	if ((m = class_getInstanceMethod(cls, sel_registerName("setConstantValues:type:withRange:"))) != NULL) {
+		gOrigFCSetRange = (void (*)(id, SEL, const void *, uint64_t, NSRange))method_setImplementation(m, (IMP)fcSetRange);
+	}
+	if ((m = class_getInstanceMethod(cls, sel_registerName("setConstantValue:type:withName:"))) != NULL) {
+		gOrigFCSetName = (void (*)(id, SEL, const void *, uint64_t, id))method_setImplementation(m, (IMP)fcSetName);
+	}
+	if ((m = class_getInstanceMethod(cls, sel_registerName("reset"))) != NULL) {
+		gOrigFCReset = (void (*)(id, SEL))method_setImplementation(m, (IMP)fcReset);
+	}
+	if ((m = class_getInstanceMethod(cls, sel_registerName("copyWithZone:"))) != NULL) {
+		gOrigFCCopy = (id (*)(id, SEL, struct _NSZone *))method_setImplementation(m, (IMP)fcCopy);
+	}
+	whylog("hooked %s for function constants", class_getName(cls));
+}
+
+static int
+fcCmp(const void * a, const void * b)
+{
+	uint32_t ia = ((const struct whycc_fc *)a)->index, ib = ((const struct whycc_fc *)b)->index;
+	return ia < ib ? -1 : ia > ib ? 1 : 0;
+}
+
+static void
+fnAttachConstants(struct fnstate * fs, id constants)
+{
+	static int fcLog;
+	NSMutableDictionary * idxCopy = nil;
+	NSMutableDictionary * nameCopy = nil;
+
+	if (constants == nil) {
+		return;
+	}
+	pthread_mutex_lock(&gFCLock);
+	NSMutableDictionary * d = fcBagFor(constants, NO);
+	NSMutableDictionary * dn = fcNameBagFor(constants, NO);
+	if (d != nil && [d count] > 0) {
+		idxCopy = [d mutableCopy];
+	}
+	if (dn != nil && [dn count] > 0) {
+		nameCopy = [dn mutableCopy];
+	}
+	pthread_mutex_unlock(&gFCLock);
+
+	NSUInteger maxCnt = (idxCopy ? [idxCopy count] : 0) + (nameCopy ? [nameCopy count] : 0);
+	if (maxCnt > 0) {
+		struct whycc_fc * arr = calloc(maxCnt, sizeof(*arr));
+		uint32_t n = 0, nNamed = 0;
+		struct whycc_lib * lib = STATE(fs->library, struct libstate)->lib;
+		const char * fname = [fs->name UTF8String];
+
+		for (NSNumber * k in idxCopy) {
+			NSNumber * v = [idxCopy objectForKey:k];
+			arr[n].index = [k unsignedIntValue];
+			arr[n].bits = [v unsignedLongLongValue];
+			n++;
+		}
+		if (nameCopy != nil && [nameCopy count] > 0) {
+			NSNumber * genVal = [nameCopy objectForKey:@"fc_generic"];
+			if (genVal != nil && [genVal unsignedLongLongValue] != 0) {
+				fs->is_generic = YES;
+			}
+			pthread_mutex_lock(&gCCLock);
+			for (NSString * k in nameCopy) {
+				uint32_t idx = 0;
+
+				if (whycc_resolve_fc_name(lib, fname, [k UTF8String], &idx)) {
+					NSNumber * v = [nameCopy objectForKey:k];
+					BOOL dup = NO;
+					for (uint32_t j = 0; j < n; j++) {
+						if (arr[j].index == idx) {
+							arr[j].bits = [v unsignedLongLongValue];
+							dup = YES;
+							break;
+						}
+					}
+					if (!dup) {
+						arr[n].index = idx;
+						arr[n].bits = [v unsignedLongLongValue];
+						n++;
+					}
+					nNamed++;
+				}
+			}
+			pthread_mutex_unlock(&gCCLock);
+		}
+		if (n > 0) {
+			qsort(arr, n, sizeof(*arr), fcCmp);
+			free(fs->fcs);
+			fs->fcs = arr;
+			fs->nfcs = n;
+			if (fcLog < 10) {
+				char nz[220] = "";
+				size_t p = 0;
+				if (nameCopy != nil) {
+					for (NSString * k in nameCopy) {
+						uint64_t val = [[nameCopy objectForKey:k] unsignedLongLongValue];
+						if (val != 0 && p + 32 < sizeof(nz)) {
+							p += (size_t)snprintf(nz + p, sizeof(nz) - p, "%s%s=%llu",
+							    p ? " " : "", [k UTF8String], (unsigned long long)val);
+						}
+					}
+				}
+				whylog("newFunction %s with %u function constants (%u named%s%s)", fname, n, nNamed,
+				    p ? "; nz: " : "", nz);
+				fcLog++;
+			}
+		} else {
+			free(arr);
+		}
+	}
+	[idxCopy release];
+	[nameCopy release];
+}
+
+static id
+libNewFunctionConstants(id self, SEL cmd, id name, id constants, NSError ** err)
+{
+	id f = libNewFunction(self, cmd, name);
+
+	if (f == nil) {
+		whyError(err, @"MTLLibraryErrorDomain", "no such function");
+		return nil;
+	}
+	fnAttachConstants(STATE(f, struct fnstate), constants);
+	return f;
+}
+
+static id
+libNewFunctionDescriptor(id self, SEL cmd, id desc, NSError ** err)
+{
+	id f = libNewFunction(self, cmd, desc != nil ? [desc name] : nil);
+
+	if (f == nil) {
+		whyError(err, @"MTLLibraryErrorDomain", "no such function");
+		return nil;
+	}
+	if (desc != nil && [desc respondsToSelector:sel_registerName("constantValues")]) {
+		id cv = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("constantValues"));
+		fnAttachConstants(STATE(f, struct fnstate), cv);
+	}
+	return f;
+}
+
+static id
+fnNewSpecialized(id self, __unused SEL _cmd, id desc, __unused id archive, __unused id cache, NSError ** err)
+{
+	struct fnstate * src = STATE(self, struct fnstate);
+	id cv = (desc != nil && [desc respondsToSelector:sel_registerName("constantValues")]) ?
+	    ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("constantValues")) : nil;
+
+	if (err != NULL) {
+		*err = nil;
+	}
+	if (cv != nil) {
+		id f = libNewFunction(src->library, _cmd, src->name);
+		if (f != nil) {
+			fnAttachConstants(STATE(f, struct fnstate), cv);
+			return f;
+		}
+	}
+	return [self retain];
+}
+
+static id
+libLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct libstate)->label;
+}
+
+static void
+libSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct libstate * st = STATE(self, struct libstate);
+
+	[st->label release];
+	st->label = [label copy];
+}
+
+static void
+fnDealloc(id self, __unused SEL _cmd)
+{
+	struct fnstate * st = STATE(self, struct fnstate);
+	struct objc_super sup = { self, class_getSuperclass(gFunctionClass) };
+
+	free(st->fcs);
+	[st->library release];
+	[st->name release];
+	[st->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static id
+fnName(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct fnstate)->name;
+}
+
+static uint64_t
+fnType(id self, __unused SEL _cmd)
+{
+	return (uint64_t)STATE(self, struct fnstate)->type + 1;       /* MTLFunctionType: vertex 1, fragment 2, kernel 3 */
+}
+
+static id
+fnLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct fnstate)->label;
+}
+
+static void
+fnSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct fnstate * st = STATE(self, struct fnstate);
+
+	[st->label release];
+	st->label = [label copy];
+}
+
+static id
+makePipeline(id function, NSError ** err)
+{
+	struct fnstate * fs;
+	struct libstate * ls;
+	struct pipestate * ps;
+	char why[256] = "";
+	const char * refuse;
+	struct why5_kernel k;
+	id o;
+	size_t codelen;
+
+	if (function == nil || !whyOpen()) {
+		whyError(err, @"MTLLibraryErrorDomain", "no function, or no GPU");
+		return nil;
+	}
+	fs = STATE(function, struct fnstate);
+	ls = STATE(fs->library, struct libstate);
+	if (fs->type != 2) {
+		whylog("pipeline of %s: not a kernel function", [fs->name UTF8String]);
+		whyError(err, @"MTLLibraryErrorDomain", "not a kernel function");
+		return nil;
+	}
+	pthread_mutex_lock(&gCCLock);
+	if (!whycc_compile(ls->lib, [fs->name UTF8String], fs->fcs, fs->nfcs, &k, why, sizeof(why))) {
+		pthread_mutex_unlock(&gCCLock);
+		whylog("pipeline of %s: the compiler refused it: %s", [fs->name UTF8String], why);
+		whyError(err, @"MTLLibraryErrorDomain", why);
+		return nil;
+	}
+	pthread_mutex_unlock(&gCCLock);
+	if ((refuse = why5_refuse_kernel(&k)) != NULL) {
+		whylog("pipeline of %s: %s", [fs->name UTF8String], refuse);
+		whyError(err, @"MTLLibraryErrorDomain", refuse);
+		whycc_kernel_free(&k);
+		return nil;
+	}
+	o = makeObject(gPipelineClass, sizeof(struct pipestate));
+	if (o == nil) {
+		whycc_kernel_free(&k);
+		return nil;
+	}
+	ps = STATE(o, struct pipestate);
+	memset(ps, 0, sizeof(*ps));
+	ps->k = k;
+	codelen = (size_t)k.instrlen * 128;
+	if (codelen < (size_t)k.nwords * 4) {
+		codelen = (size_t)k.nwords * 4;
+	}
+	pthread_mutex_lock(&gGPULock);
+	if (!whyBufNew((codelen + 4095) & ~(size_t)4095, &ps->code)) {
+		pthread_mutex_unlock(&gGPULock);
+		whycc_kernel_free(&ps->k);
+		ps->function = nil;
+		whyError(err, @"MTLLibraryErrorDomain", "no memory for the code");
+		[o release];
+		return nil;
+	}
+	pthread_mutex_unlock(&gGPULock);
+	memset(ps->code.cpu, 0, ps->code.len);
+	memcpy(ps->code.cpu, k.words, (size_t)k.nwords * 4);
+	ps->function = [function retain];
+	whylog("pipeline %s: %u words, instrlen %u, constlen %u, %u ssbos, %u ranges, code at GPU %#llx", k.name, k.nwords,
+	    k.instrlen, k.constlen, k.num_ssbos, k.nranges, (unsigned long long)ps->code.gpu);
+	return o;
+}
+
+static id
+deviceNewPipeline(__unused id self, __unused SEL _cmd, id function, NSError ** err)
+{
+	return makePipeline(function, err);
+}
+
+static id
+deviceNewPipelineOptions(__unused id self, __unused SEL _cmd, id function, __unused uint64_t options, id * reflection, NSError ** err)
+{
+	if (reflection != NULL) {
+		*reflection = nil;
+	}
+	return makePipeline(function, err);
+}
+
+static id
+deviceNewPipelineDescriptor(__unused id self, __unused SEL _cmd, id descriptor, __unused uint64_t options, id * reflection, NSError ** err)
+{
+	id function = ((id (*)(id, SEL))objc_msgSend)(descriptor, sel_registerName("computeFunction"));
+
+	if (reflection != NULL) {
+		*reflection = nil;
+	}
+	return makePipeline(function, err);
+}
+
+typedef void (^WhyPipelineDone)(id, NSError *);
+
+static void
+deviceNewPipelineAsync(__unused id self, __unused SEL _cmd, id function, id handler)
+{
+	NSError * err = nil;
+	id p = makePipeline(function, &err);
+
+	((WhyPipelineDone)handler)(p, err);
+	[p release];
+}
+
+static void
+pipeDealloc(id self, __unused SEL _cmd)
+{
+	struct pipestate * st = STATE(self, struct pipestate);
+	struct objc_super sup = { self, class_getSuperclass(gPipelineClass) };
+
+	pthread_mutex_lock(&gGPULock);
+	whyBufFree(&st->code);
+	pthread_mutex_unlock(&gGPULock);
+	whycc_kernel_free(&st->k);
+	[st->function release];
+	[st->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static uint64_t
+pipeMaxThreads(__unused id self, __unused SEL _cmd)
+{
+	return 256;
+}
+
+static uint64_t
+pipeWidth(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct pipestate)->k.double_threadsize ? 64 : 32;
+}
+
+static uint64_t
+pipeStaticShared(__unused id self, __unused SEL _cmd)
+{
+	return 0;
+}
+
+static id
+pipeLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct pipestate)->label;
+}
+
+static void
+pipeSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct pipestate * st = STATE(self, struct pipestate);
+
+	[st->label release];
+	st->label = [label copy];
+}
+
+/* ---- the compute encoder ---- */
+
+static id
+cbComputeEncoder(id self, __unused SEL _cmd)
+{
+	id e = makeObject(gComputeClass, sizeof(struct cenc));
+	struct cenc * ce;
+
+	if (e == nil) {
+		return nil;
+	}
+	ce = STATE(e, struct cenc);
+	memset(ce, 0, sizeof(*ce));
+	ce->commandBuffer = [self retain];
+	return [e autorelease];
+}
+
+static id
+cbComputeEncoderDispatchType(id self, SEL cmd, __unused uint64_t type)
+{
+	return cbComputeEncoder(self, cmd);
+}
+
+static id
+cbComputeEncoderDescriptor(id self, SEL cmd, __unused id descriptor)
+{
+	return cbComputeEncoder(self, cmd);
+}
+
+static void
+cencDealloc(id self, __unused SEL _cmd)
+{
+	struct cenc * ce = STATE(self, struct cenc);
+	struct objc_super sup = { self, class_getSuperclass(gComputeClass) };
+
+	for (int i = 0; i < WHY5_MAX_BUFFERS; i++) {
+		[ce->buf[i] release];
+		free(ce->bytes[i]);
+	}
+	[ce->pipeline release];
+	[ce->commandBuffer release];
+	[ce->label release];
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel_registerName("dealloc"));
+}
+
+static void
+cencSetPipeline(id self, __unused SEL _cmd, id pipeline)
+{
+	struct cenc * ce = STATE(self, struct cenc);
+
+	[pipeline retain];
+	[ce->pipeline release];
+	ce->pipeline = pipeline;
+}
+
+static void
+cencSetBuffer(id self, __unused SEL _cmd, id buffer, uint64_t offset, uint64_t index)
+{
+	struct cenc * ce = STATE(self, struct cenc);
+
+	if (index >= WHY5_MAX_BUFFERS) {
+		whylog("setBuffer at index %llu: the table holds %d", (unsigned long long)index, WHY5_MAX_BUFFERS);
+		return;
+	}
+	[buffer retain];
+	[ce->buf[index] release];
+	ce->buf[index] = buffer;
+	ce->off[index] = offset;
+	free(ce->bytes[index]);
+	ce->bytes[index] = NULL;
+	ce->blen[index] = 0;
+}
+
+static void
+cencSetBufferOffset(id self, __unused SEL _cmd, uint64_t offset, uint64_t index)
+{
+	if (index < WHY5_MAX_BUFFERS) {
+		STATE(self, struct cenc)->off[index] = offset;
+	}
+}
+
+static void
+cencSetBuffers(id self, SEL cmd, const id * buffers, const uint64_t * offsets, NSRange range)
+{
+	for (NSUInteger i = 0; i < range.length; i++) {
+		cencSetBuffer(self, cmd, buffers[i], offsets[i], range.location + i);
+	}
+}
+
+static void
+cencSetBytes(id self, __unused SEL _cmd, const void * bytes, uint64_t length, uint64_t index)
+{
+	struct cenc * ce = STATE(self, struct cenc);
+
+	if (index >= WHY5_MAX_BUFFERS || length == 0 || length > 4096) {
+		whylog("setBytes of %llu at index %llu refused", (unsigned long long)length, (unsigned long long)index);
+		return;
+	}
+	[ce->buf[index] release];
+	ce->buf[index] = nil;
+	free(ce->bytes[index]);
+	ce->bytes[index] = malloc((size_t)length);
+	memcpy(ce->bytes[index], bytes, (size_t)length);
+	ce->blen[index] = (uint32_t)length;
+}
+
+static void
+cencAddDispatch(id self, uint32_t * groups, uint32_t * local)
+{
+	struct cenc * ce = STATE(self, struct cenc);
+	struct cbstate * st = STATE(ce->commandBuffer, struct cbstate);
+	struct op * op;
+	struct dispatch * d;
+
+	if (ce->pipeline == nil) {
+		whylog("a dispatch with no pipeline state set");
+		return;
+	}
+	op = cbAddOp(st);
+	d = calloc(1, sizeof(*d));
+	op->kind = OP_DISPATCH;
+	op->disp = d;
+	d->pipeline = [ce->pipeline retain];
+	for (int i = 0; i < WHY5_MAX_BUFFERS; i++) {
+		d->buf[i] = [ce->buf[i] retain];
+		d->off[i] = ce->off[i];
+		if (ce->bytes[i] != NULL) {
+			d->bytes[i] = malloc(ce->blen[i]);
+			memcpy(d->bytes[i], ce->bytes[i], ce->blen[i]);
+			d->blen[i] = ce->blen[i];
+		}
+	}
+	memcpy(d->groups, groups, sizeof(d->groups));
+	memcpy(d->local, local, sizeof(d->local));
+}
+
+static void
+cencDispatchGroups(id self, __unused SEL _cmd, WhySize groups, WhySize local)
+{
+	uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
+	uint32_t l[3] = { (uint32_t)local.width, (uint32_t)local.height, (uint32_t)local.depth };
+
+	cencAddDispatch(self, g, l);
+}
+
+/* Metal runs exactly GRID threads; this GPU runs whole groups, so the grid is rounded up to them */
+static void
+cencDispatchThreads(id self, __unused SEL _cmd, WhySize grid, WhySize local)
+{
+	uint32_t l[3] = { (uint32_t)local.width, (uint32_t)local.height, (uint32_t)local.depth };
+	uint32_t g[3];
+
+	if (l[0] == 0 || l[1] == 0 || l[2] == 0) {
+		whylog("dispatchThreads with a threadgroup of zero");
+		return;
+	}
+	g[0] = (uint32_t)((grid.width + l[0] - 1) / l[0]);
+	g[1] = (uint32_t)((grid.height + l[1] - 1) / l[1]);
+	g[2] = (uint32_t)((grid.depth + l[2] - 1) / l[2]);
+	if (g[0] * l[0] != grid.width || g[1] * l[1] != grid.height || g[2] * l[2] != grid.depth) {
+		whylog("dispatchThreads: a grid of %llux%llux%llu is not whole threadgroups of %ux%ux%u; the last group runs whole",
+		    (unsigned long long)grid.width, (unsigned long long)grid.height, (unsigned long long)grid.depth, l[0], l[1], l[2]);
+	}
+	cencAddDispatch(self, g, l);
+}
+
+static void
+cencEnd(id self, __unused SEL _cmd)
+{
+	STATE(self, struct cenc)->ended = YES;
+}
+
+static void
+cencNothing(__unused id self, __unused SEL _cmd, __unused uint64_t a)
+{
+}
+
+static void
+cencSharedLength(__unused id self, __unused SEL _cmd, uint64_t length, __unused uint64_t index)
+{
+	if (length != 0) {
+		whylog("setThreadgroupMemoryLength:%llu: threadgroup memory is not served yet", (unsigned long long)length);
+	}
+}
+
+static void
+cencUseResource(__unused id self, __unused SEL _cmd, __unused id resource, __unused uint64_t usage)
+{
+}
+
+static id
+cencLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct cenc)->label;
+}
+
+static void
+cencSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct cenc * ce = STATE(self, struct cenc);
+
+	[ce->label release];
+	ce->label = [label copy];
+}
+
+/* run one dispatch: bind, build the stream, submit it, wait for the flush */
+static BOOL
+runDispatch(struct op * op)
+{
+	struct dispatch * d = op->disp;
+	struct pipestate * ps = STATE(d->pipeline, struct pipestate);
+	struct why5_dispatch ld;
+	uint32_t * w;
+	const char * why = NULL;
+	size_t n, boff = 0;
+	BOOL ok;
+
+	memset(&ld, 0, sizeof(ld));
+	ld.k = &ps->k;
+	ld.code_gpu = ps->code.gpu;
+	memcpy(ld.groups, d->groups, sizeof(ld.groups));
+	memcpy(ld.local, d->local, sizeof(ld.local));
+	ld.flush_gpu = gStream.gpu + SCRATCH_OFFSET + 64;
+	ld.hole_gpu = gStream.gpu + SCRATCH_OFFSET + 128;
+	if (gBytes.handle == 0 && !whyBufNew(65536, &gBytes)) {
+		return NO;
+	}
+	for (int i = 0; i < WHY5_MAX_BUFFERS; i++) {
+		if (d->buf[i] != nil) {
+			struct bufstate * b = STATE(d->buf[i], struct bufstate);
+
+			if (d->off[i] > b->b.len) {
+				whylog("dispatch of %s: the offset of buffer %d is past its end", ps->k.name, i);
+				return NO;
+			}
+			ld.buf[i].gpu = b->b.gpu + d->off[i];
+			ld.buf[i].cpu = (uint8_t *)b->b.cpu + d->off[i];
+			ld.buf[i].bytes = b->b.len - d->off[i];
+		} else if (d->bytes[i] != NULL) {
+			uint32_t len = (d->blen[i] + 15) & ~15u;
+
+			if (boff + len > gBytes.len) {
+				whylog("dispatch of %s: too many setBytes", ps->k.name);
+				return NO;
+			}
+			memset((uint8_t *)gBytes.cpu + boff, 0, len);
+			memcpy((uint8_t *)gBytes.cpu + boff, d->bytes[i], d->blen[i]);
+			ld.buf[i].gpu = gBytes.gpu + boff;
+			ld.buf[i].cpu = (uint8_t *)gBytes.cpu + boff;
+			ld.buf[i].bytes = len;
+			boff += len;
+		} else if (ps->k.buffer_mask >> i & 1) {
+			whylog("dispatch of %s: nothing bound at buffer index %d", ps->k.name, i);
+			return NO;
+		}
+	}
+	w = malloc(STREAM_WORDS * 4);
+	n = why5_build(w, STREAM_WORDS, &ld, &why);
+	if (n == 0) {
+		whylog("dispatch of %s refused: %s", ps->k.name, why != NULL ? why : "?");
+		free(w);
+		return NO;
+	}
+	ok = whySubmit(w, n);
+	if (!ok) {
+		whylog("dispatch of %s: %ux%ux%u groups of %ux%ux%u, %zu words, FAILED", ps->k.name, ld.groups[0], ld.groups[1], ld.groups[2],
+		    ld.local[0], ld.local[1], ld.local[2], n);
+	} else {
+		whydbg("dispatch of %s: %ux%ux%u groups of %ux%ux%u, %zu words, done", ps->k.name, ld.groups[0], ld.groups[1], ld.groups[2],
+		    ld.local[0], ld.local[1], ld.local[2], n);
+	}
+	free(w);
+	return ok;
+}
+
+typedef void (^WhyHandler)(id);
+
+static void cbSyncSurfaces(struct cbstate * st);
+static BOOL runClear(struct op * op);
+static BOOL runCopyTex(struct op * op);
+static BOOL runDraw(struct op * op);
+
+static void
+cbCommit(id self, __unused SEL _cmd)
+{
+	struct cbstate * st = STATE(self, struct cbstate);
+	BOOL ok = YES;
+
+	if (st->status >= 2) {
+		return;
+	}
+	st->status = 2;                         /* Committed */
+	for (id h in st->scheduled) {
+		((WhyHandler)h)(self);
+	}
+	st->status = 3;                         /* Scheduled */
+	pthread_mutex_lock(&gGPULock);
+	for (size_t i = 0; i < st->nops && ok; i++) {
+		switch (st->ops[i].kind) {
+		case OP_FILL:
+			ok = runFill(&st->ops[i]);
+			break;
+		case OP_COPY:
+			ok = runCopy(&st->ops[i]);
+			break;
+		case OP_COPY_TEX:
+			ok = runCopyTex(&st->ops[i]);
+			break;
+		case OP_CLEAR:
+			ok = runClear(&st->ops[i]);
+			break;
+		case OP_DRAW:
+			ok = runDraw(&st->ops[i]);
+			break;
+		default:
+			ok = runDispatch(&st->ops[i]);
+			break;
+		}
+	}
+	if (ok) {
+		cbSyncSurfaces(st);
+	}
+	pthread_mutex_unlock(&gGPULock);
+	cbFreeOps(st);
+	if (ok) {
+		for (id d in st->drawables) {
+			((void (*)(id, SEL))objc_msgSend)(d, sel_registerName("present"));
+		}
+	}
+	[st->drawables removeAllObjects];
+	st->status = ok ? 4 : 5;                /* Completed or Error */
+	for (id h in st->handlers) {
+		((WhyHandler)h)(self);
+	}
+}
+
+static void
+cbEnqueue(__unused id self, __unused SEL _cmd)
+{
+}
+
+static void
+cbWait(__unused id self, __unused SEL _cmd)
+{
+	/* commit runs everything before it returns */
+}
+
+static void
+cbAddHandler(id self, __unused SEL _cmd, id block)
+{
+	[STATE(self, struct cbstate)->handlers addObject:[[block copy] autorelease]];
+}
+
+static void
+cbAddScheduled(id self, __unused SEL _cmd, id block)
+{
+	[STATE(self, struct cbstate)->scheduled addObject:[[block copy] autorelease]];
+}
+
+static uint64_t
+cbStatus(id self, __unused SEL _cmd)
+{
+	return (uint64_t)STATE(self, struct cbstate)->status;
+}
+
+static id
+cbError(id self, __unused SEL _cmd)
+{
+	if (STATE(self, struct cbstate)->status != 5) {
+		return nil;
+	}
+	return [NSError errorWithDomain:@"MTLCommandBufferErrorDomain" code:1
+	    userInfo:@{ NSLocalizedDescriptionKey: @"WhyredMetal: the GPU did not complete the work" }];
+}
+
+static id
+cbQueue(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct cbstate)->queue;
+}
+
+static id
+cbLabel(id self, __unused SEL _cmd)
+{
+	return STATE(self, struct cbstate)->label;
+}
+
+static void
+cbSetLabel(id self, __unused SEL _cmd, id label)
+{
+	struct cbstate * st = STATE(self, struct cbstate);
+
+	[st->label release];
+	st->label = [label copy];
+}
+
+static double
+cbNoTime(__unused id self, __unused SEL _cmd)
+{
+	return 0;
+}
+
+#include "WhyredRender.inc"
+
+/* ---- the device ---- */
+
+static id
+deviceInit(id self, __unused SEL _cmd, unsigned int port)
+{
+	struct objc_super sup = { self, gDeviceBase };
+	id (*send)(struct objc_super *, SEL) = (id (*)(struct objc_super *, SEL))objc_msgSendSuper;
+
+	self = send(&sup, sel_registerName("init"));
+	gPort = port;
+	gDevice = self;
+	whylog("a device for the accelerator port %u (%s)", port, self != nil ? "made" : "_MTLDevice's init gave nil");
+	return self;
+}
+
+static id
+deviceName(__unused id self, __unused SEL _cmd)
+{
+	return @"Whyred Adreno 509";
+}
+
+static uint64_t
+deviceRegistryID(__unused id self, __unused SEL _cmd)
+{
+	return gPort;
+}
+
+static uint64_t
+deviceMaxBufferLength(__unused id self, __unused SEL _cmd)
+{
+	return 16ull << 20;
+}
+
+static BOOL
+deviceYes(__unused id self, __unused SEL _cmd)
+{
+	return YES;
+}
+
+static BOOL
+deviceNo(__unused id self, __unused SEL _cmd)
+{
+	return NO;
+}
+
+static BOOL
+deviceNoFeatureSet(__unused id self, __unused SEL _cmd, __unused uint64_t set)
+{
+	return NO;
+}
+
+static uint64_t
+deviceZero(__unused id self, __unused SEL _cmd)
+{
+	return 0;
+}
+
+static uint64_t
+deviceOne(__unused id self, __unused SEL _cmd)
+{
+	return 1;
+}
+
+static Class
+newClass(const char * name, const char * base)
+{
+	Class b = objc_getClass(base);
+	Class cls;
+
+	if (b == Nil) {
+		whylog("this system has no %s: %s is made on NSObject", base, name);
+		b = objc_getClass("NSObject");
+	}
+	cls = objc_allocateClassPair(b, name, 0);
+	if (cls == Nil) {
+		whylog("could not make the class %s", name);
+	}
+	return cls;
+}
+
+#define ADD(cls, sel, imp, types) class_addMethod(cls, sel_registerName(sel), (IMP)imp, types)
+
+static void
+registerComputeClasses(Class device)
+{
+	static const char * const lib[] = { "MTLLibrary", NULL };
+	static const char * const fn[] = { "MTLFunction", NULL };
+	static const char * const pipe[] = { "MTLComputePipelineState", NULL };
+	static const char * const comp[] = { "MTLComputeCommandEncoder", "MTLCommandEncoder", NULL };
+
+	if ((gLibraryClass = newClass("WhyredMetalLibrary", "_MTLLibrary")) != Nil) {
+		declareNamed(gLibraryClass, lib);
+		addStubForwarding(gLibraryClass);
+		ADD(gLibraryClass, "dealloc", libDealloc, "v@:");
+		ADD(gLibraryClass, "device", objDevice, "@@:");
+		ADD(gLibraryClass, "label", libLabel, "@@:");
+		ADD(gLibraryClass, "setLabel:", libSetLabel, "v@:@");
+		ADD(gLibraryClass, "functionNames", libFunctionNames, "@@:");
+		ADD(gLibraryClass, "newFunctionWithName:", libNewFunction, "@@:@");
+		ADD(gLibraryClass, "newFunctionWithName:constantValues:error:", libNewFunctionConstants, "@@:@@^@");
+		ADD(gLibraryClass, "newFunctionWithDescriptor:error:", libNewFunctionDescriptor, "@@:@^@");
+		objc_registerClassPair(gLibraryClass);
+		ADD(device, "newLibraryWithData:error:", deviceNewLibraryData, "@@:@^@");
+		ADD(device, "newLibraryWithURL:error:", deviceNewLibraryURL, "@@:@^@");
+		ADD(device, "newLibraryWithFile:error:", deviceNewLibraryFile, "@@:@^@");
+		ADD(device, "newPipelineLibraryWithFilePath:error:", deviceNewPipelineLibrary, "@@:@^@");
+		ADD(device, "newLibraryWithSource:options:error:", deviceNewLibrarySource, "@@:@@^@");
+		ADD(device, "newDefaultLibrary", deviceNoLibrary, "@@:");
+		ADD(device, "newDefaultLibraryWithBundle:error:", deviceNoLibraryBundle, "@@:@^@");
+	}
+	if ((gFunctionClass = newClass("WhyredMetalFunction", "_MTLFunction")) != Nil) {
+		declareNamed(gFunctionClass, fn);
+		addStubForwarding(gFunctionClass);
+		ADD(gFunctionClass, "dealloc", fnDealloc, "v@:");
+		ADD(gFunctionClass, "device", objDevice, "@@:");
+		ADD(gFunctionClass, "name", fnName, "@@:");
+		ADD(gFunctionClass, "functionType", fnType, "Q@:");
+		ADD(gFunctionClass, "label", fnLabel, "@@:");
+		ADD(gFunctionClass, "setLabel:", fnSetLabel, "v@:@");
+		ADD(gFunctionClass, "newSpecializedFunctionWithDescriptor:destinationArchive:functionCache:error:", fnNewSpecialized, "@@:@@@^@");
+		objc_registerClassPair(gFunctionClass);
+	}
+	if ((gPipelineClass = newClass("WhyredMetalComputePipeline", "_MTLComputePipelineState")) != Nil) {
+		declareNamed(gPipelineClass, pipe);
+		addStubForwarding(gPipelineClass);
+		ADD(gPipelineClass, "dealloc", pipeDealloc, "v@:");
+		ADD(gPipelineClass, "device", objDevice, "@@:");
+		ADD(gPipelineClass, "label", pipeLabel, "@@:");
+		ADD(gPipelineClass, "setLabel:", pipeSetLabel, "v@:@");
+		ADD(gPipelineClass, "maxTotalThreadsPerThreadgroup", pipeMaxThreads, "Q@:");
+		ADD(gPipelineClass, "threadExecutionWidth", pipeWidth, "Q@:");
+		ADD(gPipelineClass, "staticThreadgroupMemoryLength", pipeStaticShared, "Q@:");
+		objc_registerClassPair(gPipelineClass);
+		ADD(device, "newComputePipelineStateWithFunction:error:", deviceNewPipeline, "@@:@^@");
+		ADD(device, "newComputePipelineStateWithFunction:options:reflection:error:", deviceNewPipelineOptions, "@@:@Q^@^@");
+		ADD(device, "newComputePipelineStateWithDescriptor:options:reflection:error:", deviceNewPipelineDescriptor, "@@:@Q^@^@");
+		ADD(device, "newComputePipelineStateWithFunction:completionHandler:", deviceNewPipelineAsync, "v@:@@?");
+	}
+	if ((gComputeClass = newClass("WhyredMetalComputeEncoder", "_MTLCommandEncoder")) != Nil) {
+		declareNamed(gComputeClass, comp);
+		addStubForwarding(gComputeClass);
+		ADD(gComputeClass, "dealloc", cencDealloc, "v@:");
+		ADD(gComputeClass, "device", objDevice, "@@:");
+		ADD(gComputeClass, "label", cencLabel, "@@:");
+		ADD(gComputeClass, "setLabel:", cencSetLabel, "v@:@");
+		ADD(gComputeClass, "setComputePipelineState:", cencSetPipeline, "v@:@");
+		ADD(gComputeClass, "setBuffer:offset:atIndex:", cencSetBuffer, "v@:@QQ");
+		ADD(gComputeClass, "setBufferOffset:atIndex:", cencSetBufferOffset, "v@:QQ");
+		ADD(gComputeClass, "setBuffers:offsets:withRange:", cencSetBuffers, "v@:r^@r^Q{_NSRange=QQ}");
+		ADD(gComputeClass, "setBytes:length:atIndex:", cencSetBytes, "v@:r^vQQ");
+		ADD(gComputeClass, "dispatchThreadgroups:threadsPerThreadgroup:", cencDispatchGroups,
+		    "v@:{_MTLSize=QQQ}{_MTLSize=QQQ}");
+		ADD(gComputeClass, "dispatchThreads:threadsPerThreadgroup:", cencDispatchThreads, "v@:{_MTLSize=QQQ}{_MTLSize=QQQ}");
+		ADD(gComputeClass, "setThreadgroupMemoryLength:atIndex:", cencSharedLength, "v@:QQ");
+		ADD(gComputeClass, "useResource:usage:", cencUseResource, "v@:@Q");
+		ADD(gComputeClass, "memoryBarrierWithScope:", cencNothing, "v@:Q");
+		ADD(gComputeClass, "endEncoding", cencEnd, "v@:");
+		objc_registerClassPair(gComputeClass);
+	}
+}
+
+#include "WhyredRenderReg.inc"
+
+static void
+registerObjectClasses(Class device)
+{
+	static const char * const buffer[] = { "MTLBuffer", "MTLResource", NULL };
+	static const char * const cb[] = { "MTLCommandBuffer", NULL };
+	static const char * const blit[] = { "MTLBlitCommandEncoder", "MTLCommandEncoder", NULL };
+
+	if ((gBufferClass = newClass("WhyredMetalBuffer", "_MTLResource")) != Nil) {
+		declareNamed(gBufferClass, buffer);
+		addStubForwarding(gBufferClass);
+		ADD(gBufferClass, "dealloc", bufferDealloc, "v@:");
+		ADD(gBufferClass, "device", objDevice, "@@:");
+		ADD(gBufferClass, "label", bufferLabel, "@@:");
+		ADD(gBufferClass, "setLabel:", bufferSetLabel, "v@:@");
+		ADD(gBufferClass, "contents", bufferContents, "^v@:");
+		ADD(gBufferClass, "length", bufferLength, "Q@:");
+		ADD(gBufferClass, "resourceOptions", bufferOptions, "Q@:");
+		ADD(gBufferClass, "storageMode", bufferStorageMode, "Q@:");
+		ADD(gBufferClass, "cpuCacheMode", bufferCacheMode, "Q@:");
+		ADD(gBufferClass, "hazardTrackingMode", bufferHazardMode, "Q@:");
+		ADD(gBufferClass, "allocatedSize", bufferLength, "Q@:");
+		ADD(gBufferClass, "gpuAddress", bufferGPUAddress, "Q@:");
+		ADD(gBufferClass, "didModifyRange:", bufferDidModify, "v@:{_NSRange=QQ}");
+		ADD(gBufferClass, "setPurgeableState:", bufferPurgeable, "Q@:Q");
+		ADD(gBufferClass, "newTextureWithDescriptor:offset:bytesPerRow:", bufferNewTexture, "@@:@QQ");
+		ADD(gBufferClass, "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:", bufferNewLinearTexture, "@@:@QQQ");
+		objc_registerClassPair(gBufferClass);
+		ADD(device, "newBufferWithLength:options:", deviceNewBuffer, "@@:QQ");
+		ADD(device, "newBufferWithBytes:length:options:", deviceNewBufferBytes, "@@:r^vQQ");
+		ADD(device, "newBufferWithBytesNoCopy:length:options:deallocator:", deviceNewBufferNoCopy, "@@:^vQQ@?");
+	}
+	if ((gQueueClass = newClass("WhyredMetalQueue", "_MTLCommandQueue")) != Nil) {
+		declareFamily(gQueueClass, "MTLCommandQueue");
+		addStubForwarding(gQueueClass);
+		ADD(gQueueClass, "device", objDevice, "@@:");
+		ADD(gQueueClass, "label", queueLabel, "@@:");
+		ADD(gQueueClass, "setCompletionQueue:", queueSetCompletionQueue, "v@:@");
+		ADD(gQueueClass, "completionQueue", queueCompletionQueue, "@@:");
+		ADD(gQueueClass, "dealloc", queueDealloc, "v@:");
+		ADD(gQueueClass, "commandBuffer", queueCommandBuffer, "@@:");
+		ADD(gQueueClass, "commandBufferWithUnretainedReferences", queueCommandBuffer, "@@:");
+		objc_registerClassPair(gQueueClass);
+		ADD(device, "newCommandQueue", deviceNewQueue, "@@:");
+		ADD(device, "newCommandQueueWithMaxCommandBufferCount:", deviceNewQueueMax, "@@:Q");
+	}
+	if ((gCommandBufferClass = newClass("WhyredMetalCommandBuffer", "_MTLCommandBuffer")) != Nil) {
+		declareNamed(gCommandBufferClass, cb);
+		addStubForwarding(gCommandBufferClass);
+		ADD(gCommandBufferClass, "dealloc", cbDealloc, "v@:");
+		ADD(gCommandBufferClass, "device", objDevice, "@@:");
+		ADD(gCommandBufferClass, "label", cbLabel, "@@:");
+		ADD(gCommandBufferClass, "setLabel:", cbSetLabel, "v@:@");
+		ADD(gCommandBufferClass, "commandQueue", cbQueue, "@@:");
+		ADD(gCommandBufferClass, "commit", cbCommit, "v@:");
+		ADD(gCommandBufferClass, "enqueue", cbEnqueue, "v@:");
+		ADD(gCommandBufferClass, "waitUntilCompleted", cbWait, "v@:");
+		ADD(gCommandBufferClass, "waitUntilScheduled", cbWait, "v@:");
+		ADD(gCommandBufferClass, "addCompletedHandler:", cbAddHandler, "v@:@?");
+		ADD(gCommandBufferClass, "addScheduledHandler:", cbAddScheduled, "v@:@?");
+		ADD(gCommandBufferClass, "status", cbStatus, "Q@:");
+		ADD(gCommandBufferClass, "error", cbError, "@@:");
+		ADD(gCommandBufferClass, "blitCommandEncoder", cbBlitEncoder, "@@:");
+		ADD(gCommandBufferClass, "computeCommandEncoder", cbComputeEncoder, "@@:");
+		ADD(gCommandBufferClass, "computeCommandEncoderWithDispatchType:", cbComputeEncoderDispatchType, "@@:Q");
+		ADD(gCommandBufferClass, "computeCommandEncoderWithDescriptor:", cbComputeEncoderDescriptor, "@@:@");
+		ADD(gCommandBufferClass, "GPUStartTime", cbNoTime, "d@:");
+		ADD(gCommandBufferClass, "GPUEndTime", cbNoTime, "d@:");
+		ADD(gCommandBufferClass, "kernelStartTime", cbNoTime, "d@:");
+		ADD(gCommandBufferClass, "kernelEndTime", cbNoTime, "d@:");
+		objc_registerClassPair(gCommandBufferClass);
+	}
+	if ((gBlitClass = newClass("WhyredMetalBlitEncoder", "_MTLCommandEncoder")) != Nil) {
+		declareNamed(gBlitClass, blit);
+		addStubForwarding(gBlitClass);
+		ADD(gBlitClass, "dealloc", encDealloc, "v@:");
+		ADD(gBlitClass, "device", objDevice, "@@:");
+		ADD(gBlitClass, "label", encLabel, "@@:");
+		ADD(gBlitClass, "setLabel:", encSetLabel, "v@:@");
+		ADD(gBlitClass, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", encCopy, "v@:@Q@QQ");
+		ADD(gBlitClass, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:", encCopyTex, "v@:@QQ{?=QQQ}{?=QQQ}@QQ{?=QQQ}");
+		ADD(gBlitClass, "generateMipmapsForTexture:", encGenMips, "v@:@");
+		ADD(gBlitClass, "fillBuffer:range:value:", encFill, "v@:@{_NSRange=QQ}C");
+		ADD(gBlitClass, "endEncoding", encEnd, "v@:");
+		ADD(gBlitClass, "synchronizeResource:", encNothing, "v@:@");
+		objc_registerClassPair(gBlitClass);
+	}
+	registerComputeClasses(device);
+	registerRenderClasses(device);
+}
+
+__attribute__((constructor)) static void
+whyredMetalLoad(void)
+{
+	Class cls;
+
+	gDeviceBase = objc_getClass("_MTLDevice");
+	if (gDeviceBase == Nil) {
+		whylog("the system has no _MTLDevice; this plug-in registers nothing");
+		return;
+	}
+	cls = objc_allocateClassPair(gDeviceBase, "WhyredMetalDevice", 0);
+	if (cls == Nil) {
+		whylog("WhyredMetalDevice could not be made (already there?)");
+		return;
+	}
+	declareFamily(cls, "MTLDevice");
+	addStubForwarding(cls);
+	ADD(cls, "initWithAcceleratorPort:", deviceInit, "@@:I");
+	ADD(cls, "name", deviceName, "@@:");
+	ADD(cls, "registryID", deviceRegistryID, "Q@:");
+	ADD(cls, "maxBufferLength", deviceMaxBufferLength, "Q@:");
+	ADD(cls, "hasUnifiedMemory", deviceYes, "B@:");
+	ADD(cls, "isLowPower", deviceNo, "B@:");
+	ADD(cls, "isRemovable", deviceNo, "B@:");
+	ADD(cls, "isHeadless", deviceNo, "B@:");
+	ADD(cls, "supportsFeatureSet:", deviceNoFeatureSet, "B@:Q");
+	ADD(cls, "dedicatedMemorySize", deviceZero, "Q@:");
+	ADD(cls, "featureProfile", deviceOne, "Q@:");
+	registerObjectClasses(cls);
+	objc_registerClassPair(cls);
+	installFunctionConstantHooks();
+	whylog("loaded: WhyredMetalDevice and its objects are registered (base %s)", class_getName(gDeviceBase));
+}

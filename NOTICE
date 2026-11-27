@@ -5,6 +5,11 @@ Adreno 509 GPU bring-up for the Redmi Note 5 (whyred, SDM636) on ios-whyred.
 Architecture reference:
   https://github.com/oosexgang/hakios-xnu-kernel
 
+Metal plug-in:
+  userland/plugin/ is adapted from https://github.com/aLpHa-Git-69/lavender-metal
+  (MIT, Copyright (c) 2025-2026 the HakiOS authors), which carries hakios-metal
+  (MIT). See userland/plugin/LICENSE, userland/plugin/hk/LICENSE and hk/NOTICE.
+
 Licenses of the upstream material:
   kernel/   APSL 2.0, derivative of XNU and the hakios drivers/gpu code
   userland/ MIT, including Mesa's a5xx.xml and adreno_pm4.xml (MIT) and hakios-metal (MIT)
